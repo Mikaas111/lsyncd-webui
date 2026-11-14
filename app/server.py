@@ -78,6 +78,7 @@ DEFAULTS = {
     "target": "/backup",
     "folders": [],
     "twoway": [],
+    "scheduled": [],
     "excludes": [".Recycle.Bin/"],
     "delay": 5,
     "delete": True,
@@ -86,6 +87,7 @@ DEFAULTS = {
     "nightly": "03:00",
     "encryption": "ssh",
     "plain_port": 2223,
+    "schedule_hours": 6,
 }
 CONNECTION_KEYS = ("host", "port", "user", "target")
 
@@ -99,6 +101,8 @@ OUT_FORMAT = "--out-format=@lsw@{} %i %l %b %n"
 FILE_RE = re.compile(r"^@lsw@(\d*) (\S)(\S)\S*\s+(\d+) \d+ (.*)$")
 UNISON_BGN_RE = re.compile(r"^\[BGN\] (?:Copying|Updating file) (.+) from (\S+) to (\S+)$")
 UNISON_END_RE = re.compile(r"^\[END\] (?:Copying|Updating file) (.+)$")
+SCAN_RE = re.compile(r"^\s*(\d+) files\.\.\.$")
+CONSIDER_RE = re.compile(r"^(\d+) files to consider$")
 PROGRESS_RE = re.compile(
     r"^\s*([\d.,]+)\s+(\d+)%\s+(\S+)\s+(\d+:\d\d:\d\d)"
     r"(?:\s+\((?:xfr#\d+,\s*)?(?:ir|to)-chk=(\d+)/(\d+)\))?"
@@ -203,6 +207,8 @@ def validate(raw, check_folders=True):
     s["plain_port"] = int_in(raw.get("plain_port"), 1, 65535, s["plain_port"], "Port without encryption", errors)
     s["encryption"] = "none" if raw.get("encryption") == "none" else "ssh"
     s["delay"] = int_in(raw.get("delay"), 1, 3600, s["delay"], "Delay", errors)
+    s["schedule_hours"] = int_in(raw.get("schedule_hours"), 1, 168, s["schedule_hours"],
+                                 "Hours between scheduled syncs", errors)
     s["bwlimit"] = int_in(raw.get("bwlimit"), 0, 10_000_000, 0, "Bandwidth limit", errors)
 
     target = str(raw.get("target", s["target"])).strip()
@@ -241,6 +247,8 @@ def validate(raw, check_folders=True):
 
     twoway = {clean_folder(item) for item in raw.get("twoway", []) or []}
     s["twoway"] = sorted(f for f in twoway if f in s["folders"])
+    scheduled = {clean_folder(item) for item in raw.get("scheduled", []) or []}
+    s["scheduled"] = sorted(f for f in scheduled if f in s["folders"] and f not in s["twoway"])
     if check_folders:
         for folder in s["twoway"]:
             if not os.path.isdir(rw_dir(folder)) or not os.access(rw_dir(folder), os.W_OK):
@@ -290,7 +298,19 @@ def active_folders(s):
 
 
 def mirror_folders(s):
-    return [f for f in active_folders(s) if f not in s["twoway"]]
+    """Folders lsyncd mirrors live."""
+    return [f for f in active_folders(s) if f not in s["twoway"] and f not in s["scheduled"]]
+
+
+def scheduled_folders(s):
+    """Folders mirrored every few hours instead of live, such as appdata that changes all the time."""
+    return [f for f in active_folders(s) if f in s["scheduled"]]
+
+
+def folder_mode(s, folder):
+    if folder in s["twoway"]:
+        return "twoway"
+    return "scheduled" if folder in s["scheduled"] else "mirror"
 
 
 def twoway_folders(s):
@@ -651,15 +671,19 @@ def transport_counters():
 
 
 def rsync_file_line(line, folder_for):
-    """Record a file rsync reports as sent completely. True if the line was such a report."""
+    """Record a file rsync reports as sent completely.
+
+    Returns the item's change type ("<" sent, "." unchanged, "*" deleted, ...)
+    if the line was one of these reports, else "".
+    """
     match = FILE_RE.match(line)
     if not match:
-        return False
+        return ""
     index, kind, ftype, size, name = match.groups()
     if kind in "<>" and ftype == "f":
         folder = folder_for(index)
         transfer.file_done(f"{folder}/{name}" if folder else name, int(size))
-    return True
+    return kind
 
 
 class Daemon:
@@ -860,7 +884,8 @@ class Unison(Daemon):
 # Jobs: full sync, compare, count, speed test
 # ---------------------------------------------------------------------------
 
-JOB_NAMES = {"full": "Full sync", "compare": "Compare", "count": "Count", "speed": "Speed test"}
+JOB_NAMES = {"full": "Full sync", "scheduled": "Scheduled sync", "compare": "Compare", "count": "Count",
+             "speed": "Speed test"}
 
 
 class Jobs:
@@ -870,6 +895,7 @@ class Jobs:
         self.proc = None
         self.stop_requested = False
         self.info = None
+        self.progress = {}
 
     def busy(self):
         return self.thread is not None and self.thread.is_alive()
@@ -916,9 +942,9 @@ class Jobs:
     def _run(self, kind, s, folders):
         log("task", f"{JOB_NAMES[kind]} started" + (f" for: {', '.join(folders)}" if folders else "."))
         try:
-            if kind == "full":
-                ok, message = self._full(s, folders)
-                if ok and not self.stop_requested:
+            if kind in ("full", "scheduled"):
+                ok, message = self._full(s, folders, kind)
+                if kind == "full" and ok and not self.stop_requested:
                     self._count(s, active_folders(s))
             elif kind == "compare":
                 ok, message = self._compare(s, folders)
@@ -967,25 +993,59 @@ class Jobs:
             log("rsync", explain_ssh_error(text) or text)
 
     def _on_progress(self, line):
-        if rsync_file_line(line, lambda _: self.info and self.info["folder"]):
+        """Follow rsync through a folder: scanning the main server, then comparing and sending."""
+        p = self.progress
+        kind = rsync_file_line(line, lambda _: self.info and self.info["folder"])
+        if kind:
+            if kind != "*":  # deletions are not in the list of items to check
+                p["checked"] += 1
+            self._push_progress()
+            return
+        match = SCAN_RE.match(line)
+        if match:
+            p["scanned"] = int(match.group(1))
+            self._push_progress()
+            return
+        match = CONSIDER_RE.match(line)
+        if match:
+            p["items"] = int(match.group(1))
+            self._push_progress(force=True)
+            return
+        if line.strip() == "building file list ...":
             return
         match = PROGRESS_RE.match(line)
         if not match:
             log("rsync", line)
             return
-        changes = {
-            "phase": "Transferring",
-            "bytes": int(re.sub(r"\D", "", match.group(1)) or 0),
-            "percent": int(match.group(2)),
-            "speed": match.group(3),
-            "eta": match.group(4),
-        }
-        if match.group(5):
-            left, total = int(match.group(5)), int(match.group(6))
-            changes.update(checked=total - left, files=total)
-        self.set(**changes)
+        p.update(bytes=int(re.sub(r"\D", "", match.group(1)) or 0), sent_percent=int(match.group(2)),
+                 speed=match.group(3))
+        self._push_progress()
 
-    def _full(self, s, folders):
+    def _push_progress(self, force=False):
+        """Copy the counters into the job info, at most twice a second: rsync can report a million lines."""
+        p = self.progress
+        now = time.monotonic()
+        if not force and now - p.get("pushed", 0) < 0.5:
+            return
+        p["pushed"] = now
+        items = p["items"]
+        # Items compared moves when little changed; bytes sent moves during a first upload of big files
+        compared = p["checked"] / items if items else 0.0
+        fraction = min(1.0, max(compared, p["sent_percent"] / 100))
+        self.set(
+            phase="Comparing and sending" if items else "Scanning",
+            scanned=p["scanned"], items=items, checked=min(p["checked"], items) if items else 0,
+            bytes=p["bytes"], speed=p["speed"], percent=int(fraction * 100),
+        )
+
+    @staticmethod
+    def _expected_items(folder):
+        """Items in a folder at the last count, to say how far the scan is."""
+        counted = ((load_state().get("counts") or {}).get("folders") or {}).get(folder) or {}
+        main = counted.get("main") or {}
+        return main.get("dirs", 0) + main["files"] + 1 if main.get("files") is not None else 0
+
+    def _full(self, s, folders, kind="full"):
         twoway = [f for f in folders if f in s["twoway"]]
         if twoway:
             # Never rsync --delete a two-way folder: it would remove files that are new on the backup.
@@ -995,11 +1055,13 @@ class Jobs:
         folders = [f for f in folders if f not in s["twoway"]]
         ensure_remote_dirs(s, folders)
         problems = []
+        self.set(total=len(folders))
         for index, folder in enumerate(folders, 1):
             if self.stop_requested:
                 break
-            self.set(folder=folder, index=index, phase="Scanning", percent=0, bytes=0,
-                     speed="", eta="", checked=0, files=0)
+            self.progress = {"scanned": 0, "items": 0, "checked": 0, "bytes": 0, "sent_percent": 0, "speed": ""}
+            self.set(folder=folder, index=index, expected=self._expected_items(folder))
+            self._push_progress(force=True)
             src = source_dir(folder)
             with os.scandir(src) as entries:
                 empty = next(entries, None) is None
@@ -1007,11 +1069,13 @@ class Jobs:
                 log("task", f"{folder} is empty on the main server. Skipped so the backup copy is not wiped by accident.")
                 problems.append(f"{folder} (empty, skipped)")
                 continue
-            cmd = rsync_base(s) + ["--info=progress2", "--no-inc-recursive", OUT_FORMAT.format("")]
+            # flist2 reports the scan, name2 every item compared, so the progress bar keeps moving
+            cmd = rsync_base(s) + ["--info=progress2,flist2,name2", "--no-inc-recursive", OUT_FORMAT.format("")]
             if s["delete"]:
                 cmd.append("--delete")
             cmd += [src + "/", f"{SSH_ALIAS}:{remote_dir(s, folder)}/"]
             code = self._run_rsync(cmd, self._on_progress)
+            self._push_progress(force=True)
             if code in (0, 24):  # 24: some files vanished during the transfer
                 self.set(percent=100)
             elif self.stop_requested:
@@ -1026,7 +1090,13 @@ class Jobs:
             ok, message = True, f"Done: {len(folders)} mirrored folder(s) in sync."
             if twoway:
                 message += f" Unison is comparing {len(twoway)} two-way folder(s)."
-        update_state(last_full={"time": time.time(), "ok": ok, "message": message})
+        result = {"time": time.time(), "ok": ok, "message": message}
+        if kind == "scheduled":
+            update_state(last_scheduled=result)
+        else:
+            update_state(last_full=result)
+            if ok and set(scheduled_folders(s)) <= set(folders):
+                update_state(last_scheduled=result)  # this run covered the scheduled folders too
         return ok, message
 
     def _compare(self, s, folders):
@@ -1064,6 +1134,7 @@ class Jobs:
 
     def _count(self, s, folders):
         main = {}
+        self.set(total=len(folders), items=0, scanned=0, checked=0, bytes=0)
         for index, folder in enumerate(folders, 1):
             if self.stop_requested:
                 return False, "Stopped."
@@ -1156,10 +1227,25 @@ unison = Unison()
 jobs = Jobs()
 
 
+def scheduled_due(s, state, now):
+    """When the scheduled folders are next due: after the interval, or 30 minutes after a failed run."""
+    last = state.get("last_scheduled")
+    if not last:
+        return now
+    wait = s["schedule_hours"] * 3600 if last.get("ok") else 1800
+    return last["time"] + wait
+
+
 def scheduler():
     while True:
         time.sleep(20)
         s = load_settings()
+        folders = scheduled_folders(s)
+        now = time.time()
+        if s["host"] and folders and not jobs.busy() and now >= scheduled_due(s, load_state(), now):
+            ok, why = jobs.start("scheduled", folders)
+            if not ok:
+                log("schedule", f"Scheduled sync skipped: {why}")
         if not s["nightly"]:
             continue
         now = datetime.datetime.now()
@@ -1183,7 +1269,8 @@ def apply_settings(new):
     connection_changed = any(old[k] != new[k] for k in CONNECTION_KEYS)
     added = [f for f in new["folders"] if f not in old["folders"]]
     # Unison already compares two-way folders in full when it (re)starts
-    run = mirror_folders(new) if connection_changed else [f for f in added if f in mirror_folders(new)]
+    copied = mirror_folders(new) + scheduled_folders(new)
+    run = copied if connection_changed else [f for f in added if f in copied]
     if new["host"] and run:
         ok, _ = jobs.start("full", run)
         message += " A full sync has started." if ok else " Start a full sync once the current task is done."
@@ -1270,13 +1357,17 @@ def status_payload():
         "inotify_max": read_int("/proc/sys/fs/inotify/max_user_watches"),
         "job": jobs.snapshot(),
         "last_full": state.get("last_full"),
+        "schedule": {
+            "folders": s["scheduled"], "hours": s["schedule_hours"], "last": state.get("last_scheduled"),
+            "next": scheduled_due(s, state, time.time()) if s["scheduled"] else None,
+        },
         "last_compare": compare,
         "counts": state.get("counts"),
         "transfer": transfer.snapshot(),
         "speedtest": state.get("speedtest"),
         "folders": [
             {"path": f, "exists": os.path.isdir(source_dir(f)), "target": remote_dir(s, f),
-             "mode": "twoway" if f in s["twoway"] else "mirror"}
+             "mode": folder_mode(s, f)}
             for f in s["folders"]
         ],
     }
@@ -1429,8 +1520,9 @@ def test_connection():
 def startup(settings):
     lsyncd.start(settings)
     unison.start(settings)
+    # Scheduled folders wait for their schedule, so a restart does not go through appdata again
     if settings["host"] and mirror_folders(settings):
-        jobs.start("full")
+        jobs.start("full", mirror_folders(settings))
 
 
 def main():

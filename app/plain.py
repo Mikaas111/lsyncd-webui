@@ -23,6 +23,7 @@ import json
 import os
 import pwd
 import secrets
+import select
 import signal
 import socket
 import struct
@@ -69,7 +70,19 @@ def recv_frame(sock, limit=MAX_FRAME):
 def write_all(fd, data):
     view = memoryview(data)
     while view:
-        view = view[os.write(fd, view):]
+        try:
+            view = view[os.write(fd, view):]
+        except BlockingIOError:  # rsync hands ssh non-blocking pipes
+            select.select([], [fd], [])
+
+
+def read_some(fd, size):
+    """os.read that waits on a non-blocking pipe instead of failing."""
+    while True:
+        try:
+            return os.read(fd, size)
+        except BlockingIOError:
+            select.select([fd], [], [])
 
 
 def challenge_message(nonce, command):
@@ -320,8 +333,8 @@ def client(config_file, args):
         try:
             while True:
                 try:
-                    data = os.read(0, CHUNK)
-                except OSError:
+                    data = read_some(0, CHUNK)
+                except OSError:  # no input at all, such as a closed stdin
                     data = b""
                 if not data:
                     sock.shutdown(socket.SHUT_WR)  # end of input

@@ -96,6 +96,13 @@ textarea { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace
 .selected-list { list-style: none; padding: 0; margin: 0; }
 .selected-list li { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--line); }
 .selected-list li .grow { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.selected-list li.group { display: block; padding: 0; }
+.selected-list li.group > details > summary { display: flex; align-items: center; gap: 8px; padding: 10px 0; color: var(--text); list-style: none; }
+.selected-list li.group > details > summary::-webkit-details-marker { display: none; }
+.selected-list li.group > details > summary::before { content: "▸"; color: var(--muted); transition: transform .15s; }
+.selected-list li.group > details[open] > summary::before { transform: rotate(90deg); }
+.selected-list ul.selected-list { padding-left: 22px; border-top: 1px solid var(--line); }
+.selected-list ul.selected-list li:last-child { border-bottom: 0; }
 label.field select { width: 100%; font-size: 14px; padding: 8px 10px; }
 select { font: inherit; font-size: 13px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 14px; }
@@ -144,16 +151,16 @@ details summary { cursor: pointer; color: var(--accent); font-size: 14px; }
       <div class="tiles transfer">
         <div class="tile"><div class="k">Speed now</div><div class="v" id="x-speed">–</div><div class="s" id="x-speed-s"></div></div>
         <div class="tile"><div class="k">Last file copied</div><div class="v path" id="x-file">–</div><div class="s" id="x-file-s"></div></div>
-        <div class="tile"><div class="k">Files copied</div><div class="v" id="x-files">–</div><div class="s">since the container started</div></div>
+        <div class="tile"><div class="k">Files copied</div><div class="v" id="x-files">–</div><div class="s">contents sent in full, since the container started</div></div>
       </div>
     </div>
 
     <div class="card">
       <h2>Live sync</h2>
-      <p class="lead">lsyncd watches the mirrored folders and sends every change to the backup server.</p>
+      <p class="lead">lsyncd watches the live folders and sends every change to the backup server.</p>
       <div class="tiles">
         <div class="tile"><div class="k">Status</div><div class="v" id="t-state">–</div><div class="s" id="t-state-s"></div></div>
-        <div class="tile"><div class="k">Waiting to be sent</div><div class="v" id="t-queue">–</div><div class="s" id="t-queue-s"></div></div>
+        <div class="tile"><div class="k">Changes waiting</div><div class="v" id="t-queue">–</div><div class="s" id="t-queue-s"></div></div>
         <div class="tile"><div class="k">Watched folders</div><div class="v" id="t-watch">–</div><div class="s" id="t-watch-s"></div></div>
         <div class="tile"><div class="k">Last change sent</div><div class="v" id="t-last">–</div><div class="s" id="t-last-s"></div></div>
       </div>
@@ -204,7 +211,7 @@ details summary { cursor: pointer; color: var(--accent); font-size: 14px; }
         <h2>Folders to sync</h2>
         <div class="row"><span class="unsaved" id="folders-dirty" hidden>Unsaved changes</span><button class="btn primary" id="save-folders">Save</button></div>
       </div>
-      <p class="lead">Tick the folders that must be on the backup. A ticked folder includes everything inside it. Per folder, choose <b>Mirror</b> (the main server decides, the backup follows) or <b>Two-way</b> (changes on either server are copied to the other). Removing a folder here stops syncing it; its copy on the backup stays.</p>
+      <p class="lead">Tick the folders that must be on the backup. A ticked folder includes everything inside it. Per folder, choose <b>Live</b> (every change reaches the backup within seconds), <b>Scheduled</b> (copied every few hours: for folders that change all the time, such as appdata, so they do not keep sending in between) or <b>Two-way</b> (changes on either server are copied to the other). Removing a folder here stops syncing it; its copy on the backup stays.</p>
       <p class="small" id="rw-warning" hidden style="color:var(--warn)">Two-way needs write access on the main server. Map the host's <code>/mnt</code> to <code>/mnt-rw</code> (read-write) in this container's settings first.</p>
       <div class="grid2">
         <div>
@@ -267,7 +274,8 @@ details summary { cursor: pointer; color: var(--accent); font-size: 14px; }
         </div>
         <div>
           <h3 class="small muted">Sync</h3>
-          <label class="field"><span>Delay (seconds)</span><input type="number" name="delay" min="1" max="3600"><small>Changes are collected this long, then sent together.</small></label>
+          <label class="field"><span>Delay (seconds)</span><input type="number" name="delay" min="1" max="3600"><small>Live folders: changes are collected this long, then sent together. A higher value sends a file that keeps changing less often.</small></label>
+          <label class="field"><span>Scheduled folders: hours between syncs</span><input type="number" name="schedule_hours" min="1" max="168"><small>Folders set to Scheduled are copied this often instead of live. The nightly full sync copies them too.</small></label>
           <label class="check"><input type="checkbox" name="delete"><span>Mirror deletions<small>Files deleted on the main server are deleted on the backup too, so the backup is an exact copy.</small></span></label>
           <label class="check"><input type="checkbox" name="compress"><span>Compress during transfer<small>Saves bandwidth, costs CPU on both servers.</small></span></label>
           <label class="field"><span>Bandwidth limit (KB/s)</span><input type="number" name="bwlimit" min="0"><small>0 means no limit.</small></label>
@@ -316,7 +324,7 @@ details summary { cursor: pointer; color: var(--accent); font-size: 14px; }
 const $ = (sel, el = document) => el.querySelector(sel);
 const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
 const nf = new Intl.NumberFormat("en-US");
-const app = { config: null, status: null, selected: new Set(), twoway: new Set(), rwAvailable: false, logSeq: 0, tab: "overview" };
+const app = { config: null, status: null, selected: new Set(), twoway: new Set(), scheduled: new Set(), openGroups: new Set(), rwAvailable: false, logSeq: 0, tab: "overview" };
 
 async function api(path, options = {}) {
   const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...options });
@@ -399,7 +407,7 @@ function renderOverview(st) {
   const l = st.lsyncd;
   $("#t-state").textContent = l.running ? "Running" : "Stopped";
   const mirrored = st.folders.filter(f => f.mode === "mirror").length;
-  $("#t-state-s").textContent = l.running ? "since " + stamp(l.since) : (l.last_error || (st.configured && !mirrored ? "no mirrored folders" : ""));
+  $("#t-state-s").textContent = l.running ? "since " + stamp(l.since) : (l.last_error || (st.configured && !mirrored ? "no live folders" : ""));
 
   const u = st.unison;
   $("#twoway-card").hidden = !u.folders.length;
@@ -412,7 +420,7 @@ function renderOverview(st) {
     $("#u-last-s").textContent = u.last_result || "";
   }
   $("#t-queue").textContent = l.running ? num(l.queue ?? 0) : "–";
-  $("#t-queue-s").textContent = l.busy ? "sending now" : (l.running ? "nothing in transit" : "");
+  $("#t-queue-s").textContent = l.busy ? "sending now" : (l.running ? "new, changed, moved or deleted items" : "");
   $("#t-watch").textContent = num(l.watching);
   const limit = st.inotify_max;
   const near = limit && l.watching && l.watching > limit * 0.9;
@@ -498,14 +506,22 @@ function renderJob(st) {
     if (job.folder) html += `<span class="muted small">Folder ${job.index} of ${job.total}: ${esc(job.folder)}</span>`;
     html += `</div>`;
     if (running) {
+      const syncing = (job.kind === "full" || job.kind === "scheduled") &&
+        (job.phase === "Scanning" || job.phase === "Comparing and sending");
       html += `<div class="bar"><div style="width:${Math.max(2, job.percent)}%"></div></div>`;
-      const bits = [`${job.percent}%`];
-      if (job.phase) bits.unshift(esc(job.phase));
-      if (job.kind === "full" && job.phase === "Transferring") {
-        bits.push(`${bytes(job.bytes)} sent`);
-        if (job.speed) bits.push(esc(job.speed));
-        if (job.eta) bits.push(`${esc(job.eta)} left`);
-        if (job.files) bits.push(`${num(job.checked)} of ${num(job.files)} items checked`);
+      const bits = [];
+      if (syncing) {
+        if (job.phase === "Scanning") {
+          bits.push(`Scanning the main server: ${num(job.scanned)} items found` + (job.expected ? ` of about ${num(job.expected)}` : ""));
+        } else {
+          bits.push(`${job.percent}% of this folder`);
+          if (job.items) bits.push(`${num(job.checked)} of ${num(job.items)} items compared`);
+        }
+        if (job.bytes) bits.push(`${bytes(job.bytes)} sent`);
+        if (job.bytes && job.speed) bits.push(esc(job.speed));
+      } else {
+        if (job.phase) bits.push(esc(job.phase));
+        bits.push(`${job.percent}%`);
       }
       html += `<div class="small muted">${bits.join(" · ")}</div>`;
     } else {
@@ -517,6 +533,13 @@ function renderJob(st) {
   const h = [];
   if (st.last_full) h.push(`Last full sync: ${stamp(st.last_full.time)}, ${esc(st.last_full.message)}`);
   if (st.settings.nightly) h.push(`Next full sync every night at ${esc(st.settings.nightly)}`);
+  const sc = st.schedule;
+  if (sc && sc.folders.length) {
+    let line = `Scheduled folders (${esc(sc.folders.join(", "))}): every ${sc.hours} h`;
+    if (sc.last) line += `, last ${stamp(sc.last.time)}${sc.last.ok ? "" : " (did not complete)"}`;
+    if (sc.next) line += `, next ${sc.next <= st.time ? "as soon as possible" : stamp(sc.next)}`;
+    h.push(line);
+  }
   $("#history").innerHTML = h.join("<br>");
 }
 
@@ -553,8 +576,9 @@ function renderCounts(st) {
       total.m[k] += m[k] || 0;
       total.b[k] += (b && b[k]) || 0;
     }
-    const twoway = st.folders.some(f => f.path === folder && f.mode === "twoway");
-    rows.push(`<tr><td>${esc(folder)}${twoway ? ` <span class="badge tone-busy">two-way</span>` : ""}</td>
+    const mode = (st.folders.find(f => f.path === folder) || {}).mode;
+    const badge = { twoway: ` <span class="badge tone-busy">two-way</span>`, scheduled: ` <span class="badge tone-muted">scheduled</span>` }[mode] || "";
+    rows.push(`<tr><td>${esc(folder)}${badge}</td>
       <td class="n">${num(m.dirs)}</td><td class="n">${num(m.files)}</td><td class="n">${bytes(m.bytes)}</td>
       <td class="n">${num(b && b.dirs)}</td><td class="n">${num(b && b.files)}</td><td class="n">${bytes(b && b.bytes)}</td>
       <td><span class="badge tone-${tone}">${esc(label)}</span></td></tr>`);
@@ -668,9 +692,9 @@ function treeNode(d) {
   });
   box.addEventListener("change", () => {
     if (box.checked) {
-      for (const s of [...app.selected]) if (s.startsWith(d.path + "/")) { app.selected.delete(s); app.twoway.delete(s); }
+      for (const s of [...app.selected]) if (s.startsWith(d.path + "/")) { app.selected.delete(s); app.twoway.delete(s); app.scheduled.delete(s); }
       app.selected.add(d.path);
-    } else { app.selected.delete(d.path); app.twoway.delete(d.path); }
+    } else { app.selected.delete(d.path); app.twoway.delete(d.path); app.scheduled.delete(d.path); }
     markDirty("#folders-dirty");
     syncTree();
     renderSelected();
@@ -682,6 +706,8 @@ function syncTree() {
   $$("#tree input[data-path]").forEach(box => {
     const p = box.dataset.path, under = covered(p);
     box.checked = app.selected.has(p) || under;
+    // Half ticked: something inside this folder is selected
+    box.indeterminate = !box.checked && [...app.selected].some(s => s.startsWith(p + "/"));
     box.disabled = under || box.dataset.broken === "1";
   });
 }
@@ -692,22 +718,51 @@ function renderSelected() {
   const items = [...app.selected].sort();
   $("#rw-warning").hidden = app.rwAvailable || !app.twoway.size;
   if (!items.length) { list.innerHTML = `<li class="muted small">Nothing selected yet.</li>`; return; }
-  list.innerHTML = items.map(p => {
-    const two = app.twoway.has(p);
-    return `<li><div class="grow"><b>${esc(p)}</b><div class="small muted">${two ? "⇄" : "→"} ${esc(target.replace(/\/$/, "") + "/" + p)}</div></div>
+  const hours = (app.config && app.config.schedule_hours) || 6;
+  const modeOf = p => (app.twoway.has(p) ? "twoway" : app.scheduled.has(p) ? "scheduled" : "mirror");
+  const row = (p, name) => {
+    const mode = modeOf(p);
+    const where = esc(target.replace(/\/$/, "") + "/" + p);
+    const how = { mirror: `→ ${where}`, scheduled: `→ ${where}, every ${hours} h`, twoway: `⇄ ${where}` }[mode];
+    const opt = (value, label) => `<option value="${value}"${mode === value ? " selected" : ""}>${label}</option>`;
+    return `<li><div class="grow"><b>${esc(name)}</b><div class="small muted">${how}</div></div>
       <select data-mode="${esc(p)}" aria-label="Sync mode for ${esc(p)}">
-        <option value="mirror"${two ? "" : " selected"}>Mirror</option>
-        <option value="twoway"${two ? " selected" : ""}>Two-way</option>
+        ${opt("mirror", "Live")}${opt("scheduled", "Scheduled")}${opt("twoway", "Two-way")}
       </select>
       <button class="btn" data-remove="${esc(p)}">Remove</button></li>`;
+  };
+  // Subfolders are listed under their top folder, folded away, so a long selection stays readable
+  const groups = new Map();
+  for (const p of items) {
+    const top = p.split("/")[0];
+    if (!groups.has(top)) groups.set(top, []);
+    groups.get(top).push(p);
+  }
+  const modeNames = { mirror: "live", scheduled: "scheduled", twoway: "two-way" };
+  list.innerHTML = [...groups].map(([top, paths]) => {
+    if (paths.length === 1 && paths[0] === top) return row(top, top);
+    const tally = {};
+    for (const p of paths) tally[modeOf(p)] = (tally[modeOf(p)] || 0) + 1;
+    const modes = Object.entries(tally).map(([m, n]) => `${n} ${modeNames[m]}`).join(", ");
+    return `<li class="group"><details data-group="${esc(top)}"${app.openGroups.has(top) ? " open" : ""}>
+      <summary><b>${esc(top)}</b><span class="small muted">${paths.length} ${paths.length === 1 ? "subfolder" : "subfolders"} · ${modes}</span></summary>
+      <ul class="selected-list">${paths.map(p => row(p, p.slice(top.length + 1))).join("")}</ul></details></li>`;
   }).join("");
+  $$("details[data-group]", list).forEach(d => d.addEventListener("toggle", () => {
+    if (d.open) app.openGroups.add(d.dataset.group); else app.openGroups.delete(d.dataset.group);
+  }));
   $$("[data-mode]", list).forEach(sel => sel.addEventListener("change", () => {
-    if (sel.value === "twoway") app.twoway.add(sel.dataset.mode); else app.twoway.delete(sel.dataset.mode);
+    const p = sel.dataset.mode;
+    app.twoway.delete(p);
+    app.scheduled.delete(p);
+    if (sel.value === "twoway") app.twoway.add(p);
+    if (sel.value === "scheduled") app.scheduled.add(p);
     markDirty("#folders-dirty");
     renderSelected();
   }));
   $$("[data-remove]", list).forEach(b => b.addEventListener("click", () => {
     app.selected.delete(b.dataset.remove);
+    app.scheduled.delete(b.dataset.remove);
     app.twoway.delete(b.dataset.remove);
     markDirty("#folders-dirty");
     syncTree();
@@ -759,6 +814,7 @@ async function save(changes, dirtyId) {
     app.config = res.settings;
     app.selected = new Set(app.config.folders);
     app.twoway = new Set(app.config.twoway);
+    app.scheduled = new Set(app.config.scheduled);
     markDirty(dirtyId, false);
     toast(res.message);
     syncTree();
@@ -768,7 +824,11 @@ async function save(changes, dirtyId) {
     toast(e.message, true);
   }
 }
-$("#save-folders").addEventListener("click", () => save({ folders: [...app.selected], twoway: [...app.twoway].filter(p => app.selected.has(p)) }, "#folders-dirty"));
+$("#save-folders").addEventListener("click", () => save({
+  folders: [...app.selected],
+  twoway: [...app.twoway].filter(p => app.selected.has(p)),
+  scheduled: [...app.scheduled].filter(p => app.selected.has(p) && !app.twoway.has(p)),
+}, "#folders-dirty"));
 $("#save-excludes").addEventListener("click", () => save({ excludes: $("#excludes").value.split("\n").map(s => s.trim()).filter(Boolean) }, "#excludes-dirty"));
 $("#save-settings").addEventListener("click", () => save(readSettings(), "#settings-dirty"));
 
@@ -842,6 +902,7 @@ async function init() {
   app.config = data.settings;
   app.selected = new Set(app.config.folders);
   app.twoway = new Set(app.config.twoway || []);
+  app.scheduled = new Set(app.config.scheduled || []);
   app.rwAvailable = !!data.rw_available;
   fillSettings(app.config);
   $("#excludes").value = app.config.excludes.join("\n");

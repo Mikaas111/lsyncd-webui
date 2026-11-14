@@ -28,7 +28,8 @@ Image: `ghcr.io/mikaas111/lsyncd-webui:latest`
 - **Two-way folders.** For folders you choose, changes made on the backup server are copied back to the main server too.
 - **Pick folders in the browser.** Tick shares or subfolders in a folder tree. Shares that are shortcuts to a pool, such as `appdata`, work too.
 - **Excludes.** Skip files like `*.tmp` or whole folders like `cache/`.
-- **Progress.** See how far a full sync is, with speed and time left.
+- **Progress.** See how far a full sync is: items found while scanning, items compared, data sent and speed.
+- **Scheduled folders.** Folders that change all the time, such as appdata, can be copied every few hours instead of live, so they do not keep sending in between.
 - **Live transfer view.** The current speed and the last file that was copied in full, updated every 2 seconds.
 - **Speed test.** Finds what limits the sync speed (the network, SSH encryption or the backup's disks) and switches to the fastest encryption.
 - **Encryption optional over a VPN.** A VPN already encrypts everything, so SSH encryption can be switched off to spare a slow CPU. The backup still only lets in the main server's key.
@@ -47,14 +48,15 @@ One image runs in two roles. You run it once on each server.
 4. **A nightly full sync is the safety net.** Once a night, rsync compares everything and fixes what live sync could not see, for example files written directly to a disk or changes made while the backup server was offline. A safety check skips any folder that is empty on the main server, so a missing disk cannot wipe the backup.
 5. **You can check at any time.** *Count files* counts folders, files and size on both servers. *Compare* checks every file's name, size and date on both servers and lists anything that differs.
 
-### Mirror or two-way, per folder
+### Live, scheduled or two-way, per folder
 
 Every selected folder has a mode:
 
-- **Mirror** (default): the main server decides. lsyncd sends its changes to the backup, and anything changed on the backup is overwritten.
+- **Live** (default): the main server decides. lsyncd sends its changes to the backup within seconds, and anything changed on the backup is overwritten.
+- **Scheduled**: also a mirror of the main server, but copied every few hours (**Settings → Scheduled folders: hours between syncs**, 6 by default) instead of live. Use it for folders that change all the time, such as appdata with its databases and logs: live sync would keep sending them in between everything else. lsyncd does not watch these folders, which also saves watches (see *Large shares*). A restart of the container does not go through them again; the schedule and the nightly full sync do.
 - **Two-way**: changes on either server are copied to the other, including deletions. This runs through [Unison](https://github.com/bcpierce00/unison), which watches both servers and keeps a record of the last sync, so it can tell a new file on one side from a deleted file on the other. When the same file changed on both servers, the newest version wins and the other one is kept next to it as a conflict copy, so nothing is lost. If one whole side looks deleted, for example because a mount is missing, Unison stops instead of copying that deletion.
 
-Two-way folders need write access on the main server, through the extra path `/mnt-rw`. Mirrored folders are never written.
+Two-way folders need write access on the main server, through the extra path `/mnt-rw`. Live and scheduled folders are never written.
 
 ### Shortcuts (exclusive shares)
 
@@ -143,7 +145,7 @@ Open the web interface at `http://MAIN-SERVER-IP:8484`. On Unraid you can also c
 ### Step 5: Choose what to mirror
 
 1. Go to **Folders** and tick the shares or folders you want on the backup.
-2. On the right, choose per folder **Mirror** or **Two-way**, then click **Save**. A full sync starts right away. Follow it on **Overview**.
+2. On the right, choose per folder **Live**, **Scheduled** or **Two-way**, then click **Save**. A full sync starts right away. Follow it on **Overview**.
 3. Optionally, go to **Excludes** and add patterns for files you never want synced.
 
 The first full sync copies everything and can take a long time. With a lot of data, you can do the first sync with both servers on the same network and move the backup server afterwards.
@@ -162,14 +164,14 @@ Counting also runs after every full sync, including the nightly one, so the over
 | Tab | What it does |
 | --- | --- |
 | **Overview** | Current transfer speed and the last file copied, live sync status, two-way sync status, the queue of changes waiting to be sent, progress of the running task, counts on both servers and the last comparison. |
-| **Folders** | Folder tree of the main server. Tick what to sync, choose Mirror or Two-way per folder, and see where each folder goes on the backup. |
+| **Folders** | Folder tree of the main server. Tick what to sync, choose Live, Scheduled or Two-way per folder, and see where each folder goes on the backup. |
 | **Excludes** | Patterns for files and folders to skip, one per line. |
 | **Settings** | Backup server address, delay, deletion mirroring, compression, bandwidth limit, nightly sync time, the SSH key and the speed test. |
 | **Log** | Everything lsyncd, rsync and the app report. |
 
 ## Large shares: raise the watch limit
 
-lsyncd needs one *inotify watch* per folder it watches. **Overview** shows how many folders are watched and the system limit. If the number gets close to the limit, raise it on the **main server's host**:
+lsyncd needs one *inotify watch* per folder it watches. **Overview** shows how many folders are watched and the system limit. Folders set to **Scheduled** are not watched, so that is one way to stay under it. If the number gets close to the limit, raise it on the **main server's host**:
 
 ```bash
 sysctl -w fs.inotify.max_user_watches=1048576
@@ -256,6 +258,8 @@ Then click **Apply**. The container picks the new paths up by itself and your se
 | Counts differ but **Compare** finds nothing | A file changed while counting. Click **Count files** again. |
 | Something was not mirrored | Files written directly to `/mnt/cache` or `/mnt/diskX` bypass live sync. The nightly full sync picks them up, or click **Full sync now**. |
 | Watched folders close to the limit | See *Large shares* above. |
+| **Changes waiting** is much higher than the rise in **Files copied** | Normal: a change can also be a new folder, a move, a deletion or a file that was already on the backup. **Files copied** only counts files whose contents were sent. |
+| A folder with many files shows 0% for a long time | rsync first scans the folder (**Scanning the main server: … items found**), then compares every item with the backup (**… of … items compared**). Both counts keep moving while it works. |
 | Syncing is slower than your internet connection | Run the speed test, see *Sync slower than expected?* above. |
 | Saving **Encryption: None** fails with "No connection to port 2223" | Update the backup container, and check that nothing blocks port 2223 between the servers. |
 | Saving a two-way folder says the container cannot write to it | Add the `/mnt-rw` path, see *Updating*. |

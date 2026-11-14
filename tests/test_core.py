@@ -81,6 +81,62 @@ class LsyncdConfigTest(unittest.TestCase):
         self.assertEqual(conf.count("{"), conf.count("}"))
 
 
+class ScheduledTest(unittest.TestCase):
+    def test_scheduled_folders_are_not_watched_live(self):
+        s, errors = server.validate({
+            "host": "10.0.0.2", "folders": ["Documents", "Photos", "appdata"],
+            "scheduled": ["Photos", "appdata", "Elsewhere"], "twoway": ["appdata"], "schedule_hours": 12,
+        })
+        self.assertEqual(errors, [])
+        self.assertEqual(s["scheduled"], ["Photos"])  # two-way wins, unknown folders are dropped
+        self.assertEqual(server.mirror_folders(s), ["Documents"])
+        self.assertEqual(server.scheduled_folders(s), ["Photos"])
+        self.assertEqual(server.folder_mode(s, "Photos"), "scheduled")
+        self.assertNotIn("Photos", server.build_lsyncd_conf(s, server.mirror_folders(s)))
+        self.assertEqual(len(server.validate({"schedule_hours": 0})[1]), 1)
+
+    def test_due_after_the_interval_or_soon_after_a_failure(self):
+        s, _ = server.validate({"schedule_hours": 6})
+        now = 1_000_000
+        self.assertEqual(server.scheduled_due(s, {}, now), now)
+        self.assertEqual(server.scheduled_due(s, {"last_scheduled": {"time": now, "ok": True}}, now), now + 6 * 3600)
+        self.assertEqual(server.scheduled_due(s, {"last_scheduled": {"time": now, "ok": False}}, now), now + 1800)
+
+
+class FullSyncProgressTest(unittest.TestCase):
+    def test_scanning_then_comparing_moves_the_bar(self):
+        jobs = server.Jobs()
+        jobs.info = {"folder": "Photos"}
+        jobs.progress = {"scanned": 0, "items": 0, "checked": 0, "bytes": 0, "sent_percent": 0, "speed": ""}
+        before = list(server.LOG)
+        jobs._on_progress("building file list ... ")
+        jobs._on_progress(" 300 files...")
+        jobs._push_progress(force=True)
+        self.assertEqual((jobs.info["phase"], jobs.info["scanned"], jobs.info["percent"]), ("Scanning", 300, 0))
+        jobs._on_progress("400 files to consider")
+        for i in range(100):
+            jobs._on_progress(f"@lsw@ .f          1 0 d/f{i}")
+        jobs._on_progress("@lsw@ *deleting   0 0 old")
+        jobs._on_progress("     1,000,000  10%   40.00MB/s    0:00:01 (xfr#1, to-chk=10/400)")
+        jobs._push_progress(force=True)
+        info = jobs.info
+        self.assertEqual((info["phase"], info["items"], info["checked"], info["percent"]),
+                         ("Comparing and sending", 400, 100, 25))
+        self.assertEqual((info["bytes"], info["speed"]), (1_000_000, "40.00MB/s"))
+        jobs._on_progress("   300,000,000  60%   40.00MB/s    0:00:01 (xfr#2, to-chk=9/400)")
+        jobs._push_progress(force=True)
+        self.assertEqual(jobs.info["percent"], 60)  # bytes sent can be ahead of items compared
+        self.assertEqual(list(server.LOG), before)  # none of this goes to the log
+
+    def test_expected_items_come_from_the_last_count(self):
+        os.makedirs(server.CONFIG_DIR, exist_ok=True)
+        server.update_state(counts={"folders": {"A": {"main": {"dirs": 9, "files": 90}}}})
+        try:
+            self.assertEqual((server.Jobs._expected_items("A"), server.Jobs._expected_items("B")), (100, 0))
+        finally:
+            server.update_state(counts=None)
+
+
 class TwoWayTest(unittest.TestCase):
     def test_twoway_must_be_a_selected_folder(self):
         s, errors = server.validate({"folders": ["Documents", "Photos"], "twoway": ["Photos", "Elsewhere"]})
@@ -165,6 +221,7 @@ class TransferTest(unittest.TestCase):
     def test_full_sync_reports_sent_files_without_logging_them(self):
         jobs = server.Jobs()
         jobs.info = {"folder": "Photos"}
+        jobs.progress = {"scanned": 0, "items": 0, "checked": 0, "bytes": 0, "sent_percent": 0, "speed": ""}
         before = list(server.LOG)
         jobs._on_progress("@lsw@ <f+++++++++ 1234 1234 2024/img 1.jpg")
         jobs._on_progress("@lsw@ cd+++++++++ 0 0 2024/")
@@ -308,6 +365,28 @@ class PlainTransportTest(unittest.TestCase):
         self.assertEqual((result.returncode, result.stdout.strip()), (0, b"3000000"))
         self.assertEqual(self.client("backup-target", "exit 24").returncode, 24)
         self.assertEqual(self.client("backup-target", "head -c 5000000 /dev/zero").stdout, bytes(5_000_000))
+
+    def test_non_blocking_pipes_like_rsync_hands_out(self):
+        # A slow reader on a non-blocking stdout, and input that arrives in pieces on a non-blocking stdin
+        out_r, out_w = os.pipe()
+        in_r, in_w = os.pipe()
+        os.set_blocking(out_w, False)
+        os.set_blocking(in_r, False)
+        proc = subprocess.Popen([sys.executable, os.path.join(APP_DIR, "plain.py"), "client", self.conf,
+                                 "backup-target", "wc -c; head -c 3000000 /dev/zero"], stdin=in_r, stdout=out_w)
+        os.close(out_w)
+        os.close(in_r)
+        for _ in range(3):
+            time.sleep(0.2)
+            os.write(in_w, b"x" * 1000)
+        os.close(in_w)
+        time.sleep(0.5)  # let the output pile up first
+        received = b""
+        while chunk := os.read(out_r, 1 << 16):
+            received += chunk
+        os.close(out_r)
+        self.assertEqual(proc.wait(timeout=30), 0)
+        self.assertEqual(received, b"3000\n" + bytes(3_000_000))
 
     def test_wrapper_uses_plain_only_when_switched_on(self):
         s, _ = server.validate({"host": "127.0.0.1", "encryption": "none", "plain_port": self.server.port})
