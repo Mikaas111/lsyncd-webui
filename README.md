@@ -195,6 +195,13 @@ On Unraid: **Docker → Check for Updates → Apply Update**. With Compose: `doc
 
 Then click **Apply**. The container picks the new paths up by itself and your selected folders stay as they are. You can remove the old `/data` and `/data-rw` paths afterwards.
 
+**Icon missing?** Containers created from an older template have no icon. Edit the container, switch on **Advanced View** at the top right, paste the URL below into **Icon URL** and click **Apply**.
+
+| Container | Icon URL |
+| --- | --- |
+| lsyncd-webui | `https://raw.githubusercontent.com/Mikaas111/lsyncd-webui/main/assets/icon.png` |
+| lsyncd-webui-backup | `https://raw.githubusercontent.com/Mikaas111/lsyncd-webui/main/assets/icon-backup.png` |
+
 ## Security notes
 
 - The backup container only accepts the main server's key, and it can only write to the backup folder you mounted.
