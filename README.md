@@ -4,6 +4,11 @@ A live, one-way mirror from a main server to a backup server, with a web interfa
 Every file you create, change, rename or delete on the main server shows up on the backup within seconds.
 Built for Unraid, but it runs on any machine with Docker.
 
+!! DISCLAIMER !!
+WATCH OUT!! This is a fully vibecoded tool that I needed for something at home.
+It works great and you are free to use it, but use it AT YOUR OWN RISK!
+I am NOT responsible for ANY lost data!!
+
 ```
  Main server                                 Backup server
 ┌──────────────────────────┐   SSH over    ┌──────────────────────────┐
