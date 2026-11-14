@@ -1,10 +1,10 @@
 # lsyncd-webui
 
 
-**!! DISCLAIMER !!**
-**WATCH OUT!! This is a fully vibecoded tool that I needed for something at home.**
-**It works great and you are free to use it, but use it AT YOUR OWN RISK!**
-**I am NOT responsible for ANY lost data!!**
+**!! DISCLAIMER !!**<br>
+**WATCH OUT!! This is a fully vibecoded tool that I needed for something at home.**<br>
+**It works great and you are free to use it, but use it AT YOUR OWN RISK!**<br>
+**I am NOT responsible for ANY lost data!!**<br>
 
 A live, one-way mirror from a main server to a backup server, with a web interface.
 Every file you create, change, rename or delete on the main server shows up on the backup within seconds.
