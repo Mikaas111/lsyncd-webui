@@ -1,6 +1,5 @@
 import importlib
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -192,10 +191,14 @@ class TransferTest(unittest.TestCase):
         self.assertEqual(server.transfer.last_file["direction"], "to backup")
 
     def test_speed_counts_what_ssh_writes(self):
+        # A process named ssh that writes what it reads, like ssh writes to the network.
+        # A script, not a link to cat: multi-call coreutils (uutils) refuse to run under another name.
         fake = os.path.join(TMP.name, "bin", "ssh")
         os.makedirs(os.path.dirname(fake), exist_ok=True)
-        if not os.path.exists(fake):
-            os.symlink(shutil.which("cat"), fake)
+        with open(fake, "w") as f:
+            f.write(f"#!{sys.executable}\nimport os\nout = os.open(os.devnull, os.O_WRONLY)\n"
+                    "while data := os.read(0, 1 << 16):\n    os.write(out, data)\n")
+        os.chmod(fake, 0o755)
         monitor = server.Transfer()
         monitor.sample()
         proc = subprocess.Popen([fake], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
