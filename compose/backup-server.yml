@@ -8,6 +8,8 @@ services:
     environment:
       ROLE: backup
       SSH_PORT: "2222"
+      # Transfers without SSH encryption (Encryption: None on the main server); 0 turns it off
+      PLAIN_PORT: "2223"
       AUTHORIZED_KEY: "ssh-ed25519 AAAA...paste the key from the main server's web UI..."
       TZ: Europe/Amsterdam
     volumes:

@@ -96,6 +96,7 @@ textarea { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace
 .selected-list { list-style: none; padding: 0; margin: 0; }
 .selected-list li { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--line); }
 .selected-list li .grow { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+label.field select { width: 100%; font-size: 14px; padding: 8px 10px; }
 select { font: inherit; font-size: 13px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 14px; }
 .chip { font: inherit; font-size: 13px; padding: 3px 10px; border: 1px dashed var(--line); border-radius: 999px; background: none; color: var(--text); cursor: pointer; }
@@ -256,6 +257,13 @@ details summary { cursor: pointer; color: var(--accent); font-size: 14px; }
           <label class="field"><span>SSH port</span><input type="number" name="port" min="1" max="65535"><small>2222 for the lsyncd-webui backup container.</small></label>
           <label class="field"><span>User</span><input type="text" name="user"></label>
           <label class="field"><span>Target folder on the backup</span><input type="text" name="target"><small>Inside the backup container this is <code>/backup</code>.</small></label>
+          <label class="field"><span>Encryption</span>
+            <select name="encryption">
+              <option value="ssh">SSH (encrypted)</option>
+              <option value="none">None, the VPN already encrypts (faster)</option>
+            </select>
+            <small>Choose None only when the address above goes through a VPN, such as WireGuard. Data is then not encrypted a second time by SSH, which saves a lot of CPU on a slow server. The backup still only lets in this server's key. Needs an up-to-date backup container.</small></label>
+          <label class="field"><span>Port without encryption</span><input type="number" name="plain_port" min="1" max="65535"><small>Used with Encryption set to None. 2223 for the lsyncd-webui backup container.</small></label>
         </div>
         <div>
           <h3 class="small muted">Sync</h3>
@@ -439,7 +447,8 @@ function renderTransfer(st) {
 
 const BOTTLENECK = {
   disk: "Writing on the backup server is the slowest link. On Unraid, set <b>Settings → Disk Settings → Tunable (md_write_method)</b> to <b>reconstruct write</b> (also called turbo write). Array writes then skip reading parity first, which is often much faster; all disks spin while writing. A cache pool for the backup share helps too.",
-  encryption: "SSH encryption is the slowest link: one of the servers runs out of CPU time for it. The fastest cipher it found is now used for all syncs.",
+  encryption: "SSH encryption is the slowest link: one of the servers runs out of CPU time for it. The fastest cipher it found is now used for all syncs. When the servers are connected through a VPN, set <b>Encryption</b> to <b>None</b> above.",
+  transport: "Passing the data through the containers is the slowest link: one of the servers runs out of CPU time.",
   network: "The network between the servers is the slowest link. The main server's upload and the backup's download both count, so check both internet connections, for example with a speed test site at each location. If both are clearly faster than this, a lower MTU on the VPN tunnel (such as 1380, on both ends) sometimes helps.",
 };
 
@@ -453,14 +462,18 @@ function renderSpeed(st) {
   let html = "";
   if (job && job.kind === "speed" && job.state === "failed") html += `<p class="small" style="color:var(--bad);margin:0 0 10px">${esc(job.message)}</p>`;
   if (!r) { box.innerHTML = html + `<span class="muted small">Not tested yet.</span>`; return; }
+  const used = ` <span class="badge tone-good">used</span>`;
   const rows = [["Network without SSH", r.network || {}, "Internet and VPN between the servers, nothing else"]];
-  for (const c of r.ciphers || []) rows.push([`SSH with <code>${esc(c.name)}</code>${c.name === r.cipher ? ` <span class="badge tone-good">used</span>` : ""}`, c, "Network plus encryption on both servers"]);
+  if (r.plain) rows.push([`Without encryption${r.encrypted === false ? used : ""}`, r.plain, "Network plus passing the data through both containers (Encryption: None)"]);
+  for (const c of r.ciphers || []) rows.push([`SSH with <code>${esc(c.name)}</code>${r.encrypted !== false && c.name === r.cipher ? used : ""}`, c, "Network plus encryption on both servers"]);
   if (r.disk) rows.push(["Disk writes on the backup", r.disk, "Writing to the backup folder, including flushing to disk"]);
-  const slowest = Math.min(...[r.disk && r.disk.bps, Math.max(0, ...(r.ciphers || []).map(c => c.bps || 0))].filter(Boolean));
+  const link = r.encrypted === false ? (r.plain && r.plain.bps) : Math.max(0, ...(r.ciphers || []).map(c => c.bps || 0));
+  const slowest = Math.min(...[r.disk && r.disk.bps, link].filter(Boolean));
   html += `<div class="table-wrap"><table><tr><th>Test</th><th class="n">Speed</th><th>Measures</th></tr>` + rows.map(([name, m, what]) =>
     `<tr><td>${name}</td><td class="n">${m.bps ? `<b>${mbs(m.bps)}</b><div class="small muted">${mbit(m.bps)}</div>` : `<span style="color:var(--bad)">${esc(m.error || "–")}</span>`}</td><td class="small muted">${what}</td></tr>`
   ).join("") + `</table></div>`;
   if (r.bottleneck) html += `<div class="tips"><b>At most about ${mbs(slowest)} (${mbit(slowest)}).</b> ${BOTTLENECK[r.bottleneck]}</div>`;
+  if (r.suggest_plain) html += `<div class="tips">Without SSH encryption the servers reached <b>${mbs(r.plain.bps)}</b>. If they are connected through a VPN, set <b>Encryption</b> to <b>None</b> above.</div>`;
   const cpu = (label, c) => c ? `${label}: ${esc(c.model || "unknown CPU")}${c.cores ? `, ${c.cores} threads` : ""}, AES-NI ${c.aes ? "yes" : "no"}` : "";
   const foot = [`Tested ${stamp(r.time)}`, cpu("Main", r.cpu && r.cpu.main), cpu("Backup", r.cpu && r.cpu.backup)].filter(Boolean);
   if (r.busy) foot.push(`<span style="color:var(--warn)">A sync was running during the test, so the numbers may be low.</span>`);

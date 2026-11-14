@@ -14,10 +14,11 @@ RUN chmod +x /app/entrypoint.sh /app/bin/ssh
 ENV ROLE=main \
     WEBUI_PORT=8484 \
     SSH_PORT=2222 \
+    PLAIN_PORT=2223 \
     CONFIG_DIR=/config \
     LANG=C.UTF-8
 
-EXPOSE 8484 2222
+EXPOSE 8484 2222 2223
 VOLUME ["/config"]
 
 HEALTHCHECK --interval=60s --timeout=10s --start-period=30s CMD ["python3", "/app/healthcheck.py"]

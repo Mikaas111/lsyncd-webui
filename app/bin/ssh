@@ -1,3 +1,10 @@
 #!/bin/sh
-# lsyncd and rsync call plain "ssh"; this makes them use lsyncd-webui's SSH settings.
-exec "${LSYNCD_WEBUI_REAL_SSH:-/usr/bin/ssh}" -F "${LSYNCD_WEBUI_SSH_CONFIG:-/config/ssh/config}" "$@"
+# lsyncd, rsync and Unison call plain "ssh"; this makes them use lsyncd-webui's SSH settings.
+# With Encryption set to None, plain.json exists and commands go to the backup container
+# without SSH encryption instead (see plain.py). LSYNCD_WEBUI_TRANSPORT=ssh forces SSH.
+config="${LSYNCD_WEBUI_SSH_CONFIG:-/config/ssh/config}"
+plain="$(dirname "$config")/plain.json"
+if [ "$LSYNCD_WEBUI_TRANSPORT" != ssh ] && [ -f "$plain" ]; then
+    exec python3 "$(dirname "$0")/../plain.py" client "$plain" "$@"
+fi
+exec "${LSYNCD_WEBUI_REAL_SSH:-/usr/bin/ssh}" -F "$config" "$@"

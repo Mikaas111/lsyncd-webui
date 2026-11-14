@@ -178,7 +178,8 @@ def _send_to_sink(proc, host, token, seconds, stop):
 
 
 def ssh_pipe(remote, cipher, seconds=8, stop=lambda: False):
-    """Data through SSH with one cipher: network plus encryption on both servers."""
+    """Data through SSH with one cipher (network plus encryption on both servers),
+    or through any other remote command runner that ignores the options."""
     proc = subprocess.Popen(remote("cat > /dev/null", ["-c", cipher, "-o", "Compression=no"]),
                             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0)
     timer = _kill_later(proc, seconds + 60)
@@ -217,20 +218,24 @@ def remote_disk(remote, target, size_mb=1024):
 
 def local_ciphers():
     try:
-        result = subprocess.run(["ssh", "-Q", "cipher"], capture_output=True, text=True, timeout=10)
+        result = subprocess.run(["ssh", "-Q", "cipher"], capture_output=True, text=True, timeout=10,
+                                env={**os.environ, "LSYNCD_WEBUI_TRANSPORT": "ssh"})
     except (OSError, subprocess.TimeoutExpired):
         return list(CIPHERS)
     known = set(result.stdout.split())
     return [c for c in CIPHERS if c in known] or list(CIPHERS)
 
 
-def verdict(network_bps, best_ssh_bps, disk_bps):
-    """Which link limits the sync: 'disk', 'encryption' or 'network'."""
-    link = best_ssh_bps or network_bps
+def verdict(network_bps, link_bps, disk_bps, encrypted=True):
+    """Which link limits the sync: 'disk', 'encryption', 'transport' or 'network'.
+
+    link_bps is what the transport in use reached: SSH, or the plain connection.
+    """
+    link = link_bps or network_bps
     if disk_bps and link and disk_bps < link * 0.9:
         return "disk"
-    if network_bps and best_ssh_bps and best_ssh_bps < network_bps * 0.75:
-        return "encryption"
+    if network_bps and link_bps and link_bps < network_bps * 0.75:
+        return "encryption" if encrypted else "transport"
     if link:
         return "network"
     return None

@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -24,6 +25,7 @@ os.symlink("../nopool/gone/", os.path.join(os.environ["DATA_DIR"], "gone"))
 server = importlib.import_module("server")
 count = importlib.import_module("count")
 speedtest = importlib.import_module("speedtest")
+plain = importlib.import_module("plain")
 
 
 def run_here(command, options=()):
@@ -231,6 +233,7 @@ class SpeedTestTest(unittest.TestCase):
         self.assertEqual(speedtest.verdict(110e6, 40e6, 200e6), "encryption")
         self.assertEqual(speedtest.verdict(25e6, 24e6, 200e6), "network")
         self.assertEqual(speedtest.verdict(None, 24e6, None), "network")
+        self.assertEqual(speedtest.verdict(110e6, 40e6, 200e6, encrypted=False), "transport")
 
     def test_fastest_cipher_goes_into_the_ssh_config(self):
         os.makedirs(server.SSH_DIR, exist_ok=True)
@@ -248,6 +251,90 @@ class SpeedTestTest(unittest.TestCase):
             self.assertNotIn("ProxyCommand", text)
         finally:
             server.update_state(speedtest=None)
+
+
+class PlainTransportTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tempfile.mkdtemp(dir=TMP.name)
+        for name in ("good", "bad"):
+            subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", os.path.join(cls.dir, name)], check=True)
+        with open(os.path.join(cls.dir, "good.pub")) as f:
+            good = f.read().strip()
+        signers = os.path.join(cls.dir, "signers")
+        with open(signers, "w") as f:
+            f.write(plain.allowed_signers(['from="10.0.0.1" ' + good]))
+        cls.server = plain.Server(0, signers, log=lambda message: None)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.key = os.path.join(cls.dir, "good")
+        cls.conf = os.path.join(cls.dir, "plain.json")
+        with open(cls.conf, "w") as f:
+            f.write('{"host": "127.0.0.1", "port": %d, "key": "%s"}' % (cls.server.port, cls.key))
+
+    def client(self, *args, data=b""):
+        return subprocess.run([sys.executable, os.path.join(APP_DIR, "plain.py"), "client", self.conf, *args],
+                              input=data, capture_output=True, timeout=30)
+
+    def test_command_is_found_like_ssh_does(self):
+        cases = [
+            (["-F", "cfg", "backup-target", "rsync", "--server", "."], "rsync --server ."),
+            (["-l", "root", "-p2222", "backup-target", "-e", "none", "unison", "-server"], "unison -server"),
+            (["-c", "aes128-gcm@openssh.com", "-o", "Compression=no", "-q", "backup-target", "cat > /dev/null"], "cat > /dev/null"),
+            (["backup-target", "--", "ls"], "ls"),
+            (["-v", "backup-target"], ""),
+        ]
+        for args, command in cases:
+            self.assertEqual(plain.command_from_ssh_args(args), command, args)
+
+    def test_output_errors_and_exit_code_come_back(self):
+        code, out, err = plain.call("127.0.0.1", self.server.port, self.key, "echo connected; echo oops >&2; exit 3")
+        self.assertEqual((code, out, err), (3, "connected\n", "oops\n"))
+
+    def test_only_the_allowed_key_gets_in(self):
+        with self.assertRaises(plain.PlainError) as caught:
+            plain.call("127.0.0.1", self.server.port, os.path.join(self.dir, "bad"), "echo hi")
+        self.assertIn("AUTHORIZED_KEY", str(caught.exception))
+
+    def test_closed_port_is_explained(self):
+        with self.assertRaises(plain.PlainError) as caught:
+            plain.call("127.0.0.1", 1, self.key, "echo hi")
+        self.assertIn("up to date", str(caught.exception))
+
+    def test_client_passes_input_through_like_ssh(self):
+        result = self.client("-F", "x", "backup-target", "wc", "-c", data=b"x" * 3_000_000)
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, b"3000000"))
+        self.assertEqual(self.client("backup-target", "exit 24").returncode, 24)
+        self.assertEqual(self.client("backup-target", "head -c 5000000 /dev/zero").stdout, bytes(5_000_000))
+
+    def test_wrapper_uses_plain_only_when_switched_on(self):
+        s, _ = server.validate({"host": "127.0.0.1", "encryption": "none", "plain_port": self.server.port})
+        server.ensure_key()
+        server.write_ssh_config(s)
+        try:
+            with open(server.PLAIN_CONFIG) as f:
+                self.assertEqual(f.read().count(str(self.server.port)), 1)
+            result = subprocess.run(["ssh", "backup-target", "echo", "via", "plain"], capture_output=True, text=True, timeout=30,
+                                    env={**os.environ, "LSYNCD_WEBUI_REAL_SSH": "/bin/false"})
+            # The wrapper signs with the container's own key, which this test server does not know
+            self.assertIn("AUTHORIZED_KEY", result.stderr)
+            self.assertEqual(server.check_plain(s)[:31], "Encryption was not turned off. ")
+        finally:
+            server.write_ssh_config(server.validate({"host": "127.0.0.1"})[0])
+        self.assertFalse(os.path.exists(server.PLAIN_CONFIG))
+
+    def test_settings(self):
+        s, errors = server.validate({"encryption": "none", "plain_port": 70000})
+        self.assertEqual((s["encryption"], s["plain_port"], len(errors)), ("none", 2223, 1))
+        self.assertEqual(server.validate({"encryption": "rot13"})[0]["encryption"], "ssh")
+
+    def test_transfer_monitor_sees_the_plain_client(self):
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)", "plain.py", "client"])
+        try:
+            time.sleep(0.2)
+            self.assertIn(str(proc.pid), [pid for pid, _ in server.transport_counters()])
+        finally:
+            proc.kill()
+            proc.wait()
 
 
 class CountTest(unittest.TestCase):

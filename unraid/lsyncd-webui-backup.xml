@@ -15,5 +15,6 @@
   <Config Name="Config" Target="/config" Default="/mnt/user/appdata/lsyncd-webui-backup" Mode="rw" Description="Host key of this backup server." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/lsyncd-webui-backup</Config>
   <Config Name="Main server key" Target="AUTHORIZED_KEY" Default="" Mode="" Description="Public key from the main server's web UI (Settings, SSH key). Starts with ssh-ed25519." Type="Variable" Display="always" Required="false" Mask="false"></Config>
   <Config Name="SSH port" Target="SSH_PORT" Default="2222" Mode="" Description="Port the main server connects to (host network)." Type="Variable" Display="always" Required="true" Mask="false">2222</Config>
+  <Config Name="Port without encryption" Target="PLAIN_PORT" Default="2223" Mode="" Description="For transfers without SSH encryption, used when the main server's Encryption setting is None. Only use that over a VPN. Accepts only the main server's key. 0 turns it off." Type="Variable" Display="advanced" Required="false" Mask="false">2223</Config>
   <Config Name="Role" Target="ROLE" Default="backup" Mode="" Description="Leave at backup." Type="Variable" Display="advanced" Required="true" Mask="false">backup</Config>
 </Container>

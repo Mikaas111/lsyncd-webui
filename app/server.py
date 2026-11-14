@@ -26,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import count
+import plain
 import speedtest
 
 def first_dir(env_name, candidates):
@@ -54,6 +55,9 @@ SSH_DIR = os.path.join(CONFIG_DIR, "ssh")
 KEY_FILE = os.path.join(SSH_DIR, "id_ed25519")
 KNOWN_HOSTS = os.path.join(SSH_DIR, "known_hosts")
 SSH_CONFIG = os.path.join(SSH_DIR, "config")
+# Present only with Encryption set to None; app/bin/ssh then uses plain.py instead of ssh
+PLAIN_CONFIG = os.path.join(SSH_DIR, "plain.json")
+PLAIN_CLIENT = os.path.join(APP_DIR, "plain.py")
 LSYNCD_CONF = os.path.join(CONFIG_DIR, "lsyncd.conf.lua")
 UNISON_DIR = os.path.join(CONFIG_DIR, "unison")
 STATUS_FILE = os.environ.get("LSYNCD_STATUS_FILE", "/tmp/lsyncd.status")
@@ -80,6 +84,8 @@ DEFAULTS = {
     "compress": False,
     "bwlimit": 0,
     "nightly": "03:00",
+    "encryption": "ssh",
+    "plain_port": 2223,
 }
 CONNECTION_KEYS = ("host", "port", "user", "target")
 
@@ -194,6 +200,8 @@ def validate(raw, check_folders=True):
         errors.append("Invalid user name.")
 
     s["port"] = int_in(raw.get("port"), 1, 65535, s["port"], "SSH port", errors)
+    s["plain_port"] = int_in(raw.get("plain_port"), 1, 65535, s["plain_port"], "Port without encryption", errors)
+    s["encryption"] = "none" if raw.get("encryption") == "none" else "ssh"
     s["delay"] = int_in(raw.get("delay"), 1, 3600, s["delay"], "Delay", errors)
     s["bwlimit"] = int_in(raw.get("bwlimit"), 0, 10_000_000, 0, "Bandwidth limit", errors)
 
@@ -342,6 +350,28 @@ def write_ssh_config(s):
     with open(SSH_CONFIG, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     os.chmod(SSH_CONFIG, 0o600)
+    if s["encryption"] == "none" and s["host"]:
+        write_json(PLAIN_CONFIG, plain_settings(s))
+    else:
+        try:
+            os.remove(PLAIN_CONFIG)
+        except OSError:
+            pass
+
+
+def plain_settings(s):
+    return {"host": s["host"], "port": s["plain_port"], "key": KEY_FILE}
+
+
+def check_plain(s):
+    """Before switching encryption off: can we log in on the backup without SSH? Returns an error or ''."""
+    try:
+        code, out, err = plain.call(s["host"], s["plain_port"], KEY_FILE, "echo connected", timeout=20)
+    except plain.PlainError as error:
+        return f"Encryption was not turned off. {error}"
+    if code != 0 or "connected" not in out:
+        return f"Encryption was not turned off. The backup server answered: {(err or out).strip() or code}"
+    return ""
 
 
 def ssh(command, timeout=60):
@@ -546,8 +576,9 @@ def build_unison_cmd(s, folders):
 class Transfer:
     """Live transfer speed and the last file that reached the other server completely.
 
-    The speed is what this container's ssh processes write (to the network, and
-    what they receive from it), sampled every second. A transfer that starts
+    The speed is what this container's ssh processes (or plain.py clients, with
+    encryption off) write: to the network, and what they receive from it.
+    Sampled every second. A transfer that starts
     and ends between two samples is missed, so it is an indication.
     """
 
@@ -566,7 +597,7 @@ class Transfer:
             self.files += 1
 
     def sample(self):
-        counters = ssh_counters()
+        counters = transport_counters()
         with self.lock:
             if self.seen is not None:
                 self.total += sum(max(0, n - self.seen.get(key, 0)) for key, n in counters.items())
@@ -594,8 +625,8 @@ class Transfer:
             time.sleep(1)
 
 
-def ssh_counters():
-    """Bytes written so far by each running ssh process."""
+def transport_counters():
+    """Bytes written so far by each running ssh process or plain.py client."""
     out = {}
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
@@ -603,7 +634,12 @@ def ssh_counters():
         try:
             with open(f"/proc/{entry}/stat", encoding="utf-8", errors="replace") as f:
                 stat = f.read()
-            if stat[stat.find("(") + 1:stat.rfind(")")] != "ssh":
+            comm = stat[stat.find("(") + 1:stat.rfind(")")]
+            if comm.startswith("python"):
+                with open(f"/proc/{entry}/cmdline", "rb") as f:
+                    if b"plain.py\0client\0" not in f.read():
+                        continue
+            elif comm != "ssh":
                 continue
             started = stat[stat.rfind(")") + 2:].split()[19]
             with open(f"/proc/{entry}/io", encoding="utf-8") as f:
@@ -1051,45 +1087,66 @@ class Jobs:
         return True, "Counted both servers."
 
     def _speed(self, s):
-        def remote(command, options=()):
+        def remote(command, options=()):  # whichever transport is set
             return ["ssh", *options, SSH_ALIAS, command]
+
+        def remote_ssh(command, options=()):
+            return ["env", "LSYNCD_WEBUI_TRANSPORT=ssh", "ssh", *options, SSH_ALIAS, command]
+
+        def remote_plain(command, options=()):
+            return [sys.executable, PLAIN_CLIENT, "client", plain_test, SSH_ALIAS, command]
 
         def stop():
             return self.stop_requested
 
         ciphers = speedtest.local_ciphers()
-        steps = len(ciphers) + 2
-        result = {"time": time.time(), "busy": transfer.speed() > 1_000_000, "ciphers": []}
+        steps = len(ciphers) + 3
+        encrypted = s["encryption"] != "none"
+        result = {"time": time.time(), "busy": transfer.speed() > 1_000_000, "ciphers": [], "encrypted": encrypted}
         self.set(phase="Network without SSH", index=1, total=steps)
         result["network"] = speedtest.network(remote, s["host"], stop=stop)
-        for index, cipher in enumerate(ciphers, 2):
+        if self.stop_requested:
+            return False, "Stopped."
+        self.set(phase="Without SSH encryption", index=2, percent=int(1 / steps * 100))
+        plain_test = os.path.join(CONFIG_DIR, "plain-speedtest.json")
+        write_json(plain_test, plain_settings(s))
+        try:
+            result["plain"] = speedtest.ssh_pipe(remote_plain, "", stop=stop)
+        finally:
+            os.remove(plain_test)
+        for index, cipher in enumerate(ciphers, 3):
             if self.stop_requested:
                 return False, "Stopped."
             self.set(phase=f"SSH with {cipher}", index=index, percent=int((index - 1) / steps * 100))
-            measured = speedtest.ssh_pipe(remote, cipher, stop=stop)
+            measured = speedtest.ssh_pipe(remote_ssh, cipher, stop=stop)
             if measured.get("error"):
                 measured["error"] = explain_ssh_error(measured["error"]) or measured["error"]
             result["ciphers"].append({"name": cipher, **measured})
         if self.stop_requested:
             return False, "Stopped."
         working = [c for c in result["ciphers"] if c.get("bps")]
-        if not working:
+        link = result["plain"].get("bps") if not encrypted else max((c["bps"] for c in working), default=None)
+        if not link:
             update_state(speedtest=result)
-            return False, "SSH to the backup server failed: " + (result["ciphers"][0].get("error") or "no answer.")
+            failed = result["plain"] if not encrypted else (result["ciphers"] or [{}])[0]
+            return False, "Could not send data to the backup server: " + (failed.get("error") or "no answer.")
         self.set(phase="Writing a 1 GB test file on the backup server", index=steps,
                  percent=int((steps - 1) / steps * 100))
         result["disk"] = speedtest.remote_disk(remote, s["target"])
         result["cpu"] = {"main": speedtest.cpu_info(), "backup": result["disk"].pop("cpu", None)}
-        best = max(working, key=lambda c: c["bps"])
-        result["cipher"] = best["name"]
+        if working:
+            best = max(working, key=lambda c: c["bps"])
+            result["cipher"] = best["name"]
+            # Worth switching off encryption when that is clearly faster
+            result["suggest_plain"] = bool(encrypted and (result["plain"].get("bps") or 0) > best["bps"] * 1.2)
         result["bottleneck"] = speedtest.verdict(
-            result["network"].get("bps"), best["bps"], result["disk"].get("bps"))
+            result["network"].get("bps"), link, result["disk"].get("bps"), encrypted)
         update_state(speedtest=result)
-        write_ssh_config(s)  # syncs from now on use the fastest cipher
+        write_ssh_config(s)  # SSH syncs from now on use the fastest cipher
         self.set(percent=100)
-        limit = min(b for b in (best["bps"], result["disk"].get("bps")) if b)
+        limit = min(b for b in (link, result["disk"].get("bps")) if b)
         where = {"disk": "writing on the backup server", "encryption": "SSH encryption",
-                 "network": "the network"}[result["bottleneck"]]
+                 "transport": "the CPU passing data through the containers", "network": "the network"}[result["bottleneck"]]
         return True, f"Done. At most {limit / 1e6:.0f} MB/s ({limit * 8 / 1e6:.0f} Mbit/s), limited by {where}."
 
 
@@ -1189,7 +1246,8 @@ def status_payload():
     return {
         "time": time.time(),
         "configured": bool(s["host"] and s["folders"]),
-        "settings": {"host": s["host"], "delay": s["delay"], "nightly": s["nightly"], "delete": s["delete"]},
+        "settings": {"host": s["host"], "delay": s["delay"], "nightly": s["nightly"], "delete": s["delete"],
+                     "encryption": s["encryption"]},
         "unison": {
             "folders": s["twoway"],
             "running": unison.running(),
@@ -1314,6 +1372,13 @@ class Handler(BaseHTTPRequestHandler):
             if errors:
                 self._send(400, {"error": " ".join(errors)})
                 return
+            old = load_settings()
+            changed = any(old[k] != settings[k] for k in ("encryption", "host", "plain_port"))
+            if settings["encryption"] == "none" and settings["host"] and changed:
+                error = check_plain(settings)
+                if error:
+                    self._send(400, {"error": error})
+                    return
             message = apply_settings(settings)
             self._send(200, {"settings": settings, "message": message})
         elif path in ("/api/jobs/full", "/api/jobs/compare", "/api/jobs/count", "/api/jobs/speed"):
@@ -1356,7 +1421,8 @@ def test_connection():
         return {"ok": False, "message": "No answer within 30 seconds. Is the VPN between the servers up?"}
     output = (result.stdout + result.stderr).strip()
     if result.returncode == 0 and "connected" in result.stdout:
-        return {"ok": True, "message": "Connected to the backup server.", "output": output}
+        how = "without SSH encryption" if s["encryption"] == "none" else "over SSH"
+        return {"ok": True, "message": f"Connected to the backup server {how}.", "output": output}
     return {"ok": False, "message": explain_ssh_error(output) or "Connection failed.", "output": output}
 
 

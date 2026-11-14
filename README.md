@@ -31,6 +31,7 @@ Image: `ghcr.io/mikaas111/lsyncd-webui:latest`
 - **Progress.** See how far a full sync is, with speed and time left.
 - **Live transfer view.** The current speed and the last file that was copied in full, updated every 2 seconds.
 - **Speed test.** Finds what limits the sync speed (the network, SSH encryption or the backup's disks) and switches to the fastest encryption.
+- **Encryption optional over a VPN.** A VPN already encrypts everything, so SSH encryption can be switched off to spare a slow CPU. The backup still only lets in the main server's key.
 - **Counts on both servers.** Folders, files and total size per folder, on the main server and on the backup, side by side.
 - **Compare.** A dry run that lists every file that differs, without changing anything.
 - **Nightly full sync.** Catches anything live sync could not see, such as files written straight to a disk.
@@ -66,7 +67,7 @@ Both containers carry everything they need (Alpine Linux, lsyncd, rsync, Unison,
 ## What you need
 
 - Two servers with Docker: Unraid 7, Unraid 8, or any Linux machine.
-- A network path from the main server to the backup server on TCP port 2222. Between two locations that is usually a VPN such as WireGuard. On the same LAN nothing extra is needed.
+- A network path from the main server to the backup server on TCP port 2222 (and 2223 if you switch encryption off). Between two locations that is usually a VPN such as WireGuard. On the same LAN nothing extra is needed.
 
 ## Install, step by step
 
@@ -183,18 +184,29 @@ Open **Settings** and click **Run speed test**. It takes about half a minute and
 | Test | What it measures |
 | --- | --- |
 | **Network without SSH** | Internet and VPN between the servers, nothing else. The backup container opens a random port for a few seconds for this; it needs host networking, which the template uses. |
+| **Without encryption** | The network plus passing the data through both containers, as with **Encryption: None** (see below). |
 | **SSH with each cipher** | The network plus encryption on both servers. The fastest cipher is used for every sync from then on. |
 | **Disk writes on the backup** | Writing a 1 GB test file to the backup folder, including flushing it to disk. The file is deleted right after. |
 
 The slowest of these is the most the sync can reach. What to do about it:
 
 - **Network.** The main server's *upload* and the backup's *download* both count, so check the internet connection at both locations, for example with a speed test site. Many connections sold as 1 Gbit upload much less. If both are clearly faster than the test, a lower MTU on the VPN tunnel (such as 1380, on both ends) sometimes helps.
-- **SSH encryption.** One of the servers runs out of CPU time. The speed test already switched to the fastest cipher. A CPU without AES-NI (shown under the results) is usually the cause.
+- **SSH encryption.** One of the servers runs out of CPU time. The speed test already switched to the fastest cipher. A CPU without AES-NI (shown under the results) is usually the cause. Over a VPN, switch encryption off, see below.
 - **Disk writes on the backup.** Unraid writes to the array with parity, which is slow by default. Set **Settings → Disk Settings → Tunable (md_write_method)** to **reconstruct write** (turbo write): writes no longer read parity first and are often much faster, but all array disks spin while writing. A cache pool for the backup share helps too.
 
 Many small files always go slower than these numbers, because every file costs a few round trips between the servers. Run the test when nothing else is syncing; it warns you if something was.
 
 The **Transfer** card on **Overview** shows the speed of everything this container sends and receives, and the last file that reached the other server in full.
+
+### Encryption off over a VPN
+
+A VPN such as WireGuard already encrypts everything between the servers, so SSH encrypts it all a second time. On a slow CPU that second layer can be what limits the speed. Under **Settings → Encryption**, choose **None, the VPN already encrypts**:
+
+- Syncs then go to the backup container's **port without encryption** (`2223`, variable `PLAIN_PORT`) instead of SSH. lsyncd, rsync and Unison work exactly as before.
+- Logging in stays as strict as with SSH: on every connection the main server signs a fresh challenge with its SSH key, and the backup only accepts the key in `AUTHORIZED_KEY`.
+- The data itself is not encrypted by the containers. Only choose this when the backup address is a VPN address, never across the internet without a VPN.
+- When you save, the main server first checks that it can log in this way. If the backup container is too old or the port is blocked, the setting is not saved and you see why.
+- Switch back to **SSH (encrypted)** at any time.
 
 ## Unraid 8 and other systems
 
@@ -229,7 +241,8 @@ Then click **Apply**. The container picks the new paths up by itself and your se
 - The backup container only accepts the main server's key, and it can only write to the backup folder you mounted.
 - The main container reads mirrored folders through a read-only mount. It only writes to folders you set to two-way.
 - The backup server's host key is trusted on the first connection and checked on every connection after that.
-- All data travels encrypted over SSH. Only the speed test's network check sends unencrypted zeros, straight to a port the backup container opens for a few seconds and that only accepts a one-time token.
+- All data travels encrypted over SSH, unless you set **Encryption** to **None**. Then the VPN is what encrypts it; the login still needs the main server's key. The speed test's network check sends unencrypted zeros, straight to a port the backup container opens for a few seconds and that only accepts a one-time token.
+- The backup container listens on port 2223 for transfers without encryption, with the same key check as SSH. Set `PLAIN_PORT` to `0` to close it if you never use it.
 - The web interface has no login unless you set `WEBUI_PASSWORD`. Never expose port 8484 to the internet.
 
 ## Troubleshooting
@@ -244,6 +257,7 @@ Then click **Apply**. The container picks the new paths up by itself and your se
 | Something was not mirrored | Files written directly to `/mnt/cache` or `/mnt/diskX` bypass live sync. The nightly full sync picks them up, or click **Full sync now**. |
 | Watched folders close to the limit | See *Large shares* above. |
 | Syncing is slower than your internet connection | Run the speed test, see *Sync slower than expected?* above. |
+| Saving **Encryption: None** fails with "No connection to port 2223" | Update the backup container, and check that nothing blocks port 2223 between the servers. |
 | Saving a two-way folder says the container cannot write to it | Add the `/mnt-rw` path, see *Updating*. |
 | A share shows no contents, or is marked *shortcut, target not reachable* | Add the `/mnt` path, see *Updating*. |
 | A file named like `report (conflict on …)` appears | That file changed on both servers. The newest version kept the normal name; this is the other version. Delete it once you have checked it. |
@@ -257,6 +271,7 @@ Then click **Apply**. The container picks the new paths up by itself and your se
 | `WEBUI_PORT` | main | `8484` | Port of the web interface |
 | `WEBUI_PASSWORD` | main | empty | Password for the web interface; any user name works |
 | `SSH_PORT` | backup | `2222` | Port the backup container listens on |
+| `PLAIN_PORT` | backup | `2223` | Port for transfers without SSH encryption (Encryption: None on the main server); `0` turns it off |
 | `AUTHORIZED_KEY` | backup | empty | Public key of the main server |
 | `TZ` | both | `UTC` | Time zone, used for the nightly sync time |
 | `DATA_DIR` | main | `/mnt/user`, else `/data` | Where the shares are read. Only set it for an unusual layout. |
