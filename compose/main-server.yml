@@ -12,4 +12,6 @@ services:
       TZ: Europe/Amsterdam
     volumes:
       - /mnt/user:/data:ro
+      # Only written for folders set to two-way; leave out if you only mirror
+      - /mnt/user:/data-rw
       - /mnt/user/appdata/lsyncd-webui:/config

@@ -25,6 +25,7 @@ Image: `ghcr.io/mikaas111/lsyncd-webui:latest`
 
 - **Live sync.** lsyncd hears about every change from the kernel and sends only that file. The backup server never scans anything, so a slow backup machine keeps up.
 - **Exact copy.** Deletions and renames are mirrored too. You can switch that off.
+- **Two-way folders.** For folders you choose, changes made on the backup server are copied back to the main server too.
 - **Pick folders in the browser.** Tick shares or subfolders in a folder tree.
 - **Excludes.** Skip files like `*.tmp` or whole folders like `cache/`.
 - **Progress.** See how far a full sync is, with speed and time left.
@@ -43,7 +44,16 @@ One image runs in two roles. You run it once on each server.
 4. **A nightly full sync is the safety net.** Once a night, rsync compares everything and fixes what live sync could not see, for example files written directly to a disk or changes made while the backup server was offline. A safety check skips any folder that is empty on the main server, so a missing disk cannot wipe the backup.
 5. **You can check at any time.** *Count files* counts folders, files and size on both servers. *Compare* checks every file's name, size and date on both servers and lists anything that differs.
 
-Both containers carry everything they need (Alpine Linux, lsyncd, rsync, OpenSSH, Python). The host only provides Docker, the folders and the network, so it does not matter which Linux your server runs.
+### Mirror or two-way, per folder
+
+Every selected folder has a mode:
+
+- **Mirror** (default): the main server decides. lsyncd sends its changes to the backup, and anything changed on the backup is overwritten.
+- **Two-way**: changes on either server are copied to the other, including deletions. This runs through [Unison](https://github.com/bcpierce00/unison), which watches both servers and keeps a record of the last sync, so it can tell a new file on one side from a deleted file on the other. When the same file changed on both servers, the newest version wins and the other one is kept next to it as a conflict copy, so nothing is lost. If one whole side looks deleted, for example because a mount is missing, Unison stops instead of copying that deletion.
+
+Two-way folders need write access on the main server, through the extra path `/data-rw`. Mirrored folders are never written.
+
+Both containers carry everything they need (Alpine Linux, lsyncd, rsync, Unison, OpenSSH, Python). The host only provides Docker, the folders and the network, so it does not matter which Linux your server runs.
 
 ## What you need
 
@@ -100,7 +110,8 @@ Then go to **Docker → Add Container**, pick **lsyncd-webui** under **Template*
 
 | Field | Value |
 | --- | --- |
-| Shares (read only) | `/mnt/user`. The container can read your shares but never change them. |
+| Shares (read only) | `/mnt/user`. Used for mirrored folders, which are never changed. |
+| Shares (read-write, two-way folders) | `/mnt/user`. Only written for folders you set to two-way. Leave it empty if you only mirror. |
 | Config | `/mnt/user/appdata/lsyncd-webui` |
 | Web UI port | `8484` |
 | Web UI password | Optional, but recommended |
@@ -122,8 +133,9 @@ Open the web interface at `http://MAIN-SERVER-IP:8484`. On Unraid you can also c
 
 ### Step 5: Choose what to mirror
 
-1. Go to **Folders**, tick the shares or folders you want on the backup, and click **Save**. A full sync starts right away. Follow it on **Overview**.
-2. Optionally, go to **Excludes** and add patterns for files you never want on the backup.
+1. Go to **Folders** and tick the shares or folders you want on the backup.
+2. On the right, choose per folder **Mirror** or **Two-way**, then click **Save**. A full sync starts right away. Follow it on **Overview**.
+3. Optionally, go to **Excludes** and add patterns for files you never want synced.
 
 The first full sync copies everything and can take a long time. With a lot of data, you can do the first sync with both servers on the same network and move the backup server afterwards.
 
@@ -140,8 +152,8 @@ Counting also runs after every full sync, including the nightly one, so the over
 
 | Tab | What it does |
 | --- | --- |
-| **Overview** | Live sync status, the queue of changes waiting to be sent, progress of the running task, counts on both servers and the last comparison. |
-| **Folders** | Folder tree of the main server. Tick what to mirror and see where each folder goes on the backup. |
+| **Overview** | Live sync status, two-way sync status, the queue of changes waiting to be sent, progress of the running task, counts on both servers and the last comparison. |
+| **Folders** | Folder tree of the main server. Tick what to sync, choose Mirror or Two-way per folder, and see where each folder goes on the backup. |
 | **Excludes** | Patterns for files and folders to skip, one per line. |
 | **Settings** | Backup server address, delay, deletion mirroring, compression, bandwidth limit, nightly sync time and the SSH key. |
 | **Log** | Everything lsyncd, rsync and the app report. |
@@ -160,7 +172,7 @@ That command lasts until the next reboot. To make it stick, run it at every boot
 
 Unraid 8 moves from Slackware to a Fedora base. lsyncd-webui does not depend on the host system:
 
-- lsyncd, rsync, SSH and Python all live inside the containers. The host only provides Docker, the mounted folders and the network.
+- lsyncd, rsync, Unison, SSH and Python all live inside the containers. The host only provides Docker, the mounted folders and the network.
 - It does not use any Unraid plugin, script or host SSH setting.
 - Unraid 8 adds native Docker Compose, and the files in [`compose/`](compose) work as they are.
 
@@ -168,10 +180,12 @@ Unraid 8 moves from Slackware to a Fedora base. lsyncd-webui does not depend on 
 
 On Unraid: **Docker → Check for Updates → Apply Update**. With Compose: `docker compose pull && docker compose up -d`. Settings, keys and status live in `/config`, so they survive updates.
 
+**Installed before two-way folders existed?** To use two-way, edit the **lsyncd-webui** container on the main server, click **Add another Path, Port, Variable, Label or Device**, and add a **Path** with container path `/data-rw`, host path `/mnt/user` and access mode **Read/Write**. Then click **Apply**.
+
 ## Security notes
 
 - The backup container only accepts the main server's key, and it can only write to the backup folder you mounted.
-- The main container mounts your shares read only.
+- The main container reads mirrored folders through a read-only mount. It only writes to folders you set to two-way.
 - The backup server's host key is trusted on the first connection and checked on every connection after that.
 - All data travels encrypted over SSH.
 - The web interface has no login unless you set `WEBUI_PASSWORD`. Never expose port 8484 to the internet.
@@ -187,6 +201,9 @@ On Unraid: **Docker → Check for Updates → Apply Update**. With Compose: `doc
 | Counts differ but **Compare** finds nothing | A file changed while counting. Click **Count files** again. |
 | Something was not mirrored | Files written directly to `/mnt/cache` or `/mnt/diskX` bypass live sync. The nightly full sync picks them up, or click **Full sync now**. |
 | Watched folders close to the limit | See *Large shares* above. |
+| Saving a two-way folder says the container cannot write to it | Add the `/data-rw` path, see *Updating*. |
+| A file named like `report (conflict on …)` appears | That file changed on both servers. The newest version kept the normal name; this is the other version. Delete it once you have checked it. |
+| **Two-way sync is not running** | Open **Log** and look at the lines marked `[unison]`. |
 
 ## Environment variables
 

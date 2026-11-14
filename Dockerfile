@@ -1,8 +1,12 @@
 FROM alpine:3.22
 
-# One image, two roles: ROLE=main (web UI + lsyncd) or ROLE=backup (SSH receiver)
-RUN apk add --no-cache lsyncd rsync openssh-client openssh-keygen openssh-server python3 tini tzdata \
- && sed -i 's/^root:[^:]*:/root:*:/' /etc/shadow
+# One image, two roles: ROLE=main (web UI + lsyncd + Unison) or ROLE=backup (SSH receiver)
+RUN apk add --no-cache lsyncd rsync unison openssh-client openssh-keygen openssh-server python3 tini tzdata \
+ && sed -i 's/^root:[^:]*:/root:*:/' /etc/shadow \
+ && for f in /usr/bin/unison-fsmonitor-*; do \
+      [ -e "$f" ] && [ ! -e /usr/bin/unison-fsmonitor ] && ln -s "$f" /usr/bin/unison-fsmonitor; \
+    done; \
+    command -v unison-fsmonitor
 
 COPY app /app
 RUN chmod +x /app/entrypoint.sh /app/bin/ssh
@@ -11,6 +15,7 @@ ENV ROLE=main \
     WEBUI_PORT=8484 \
     SSH_PORT=2222 \
     DATA_DIR=/data \
+    DATA_RW_DIR=/data-rw \
     CONFIG_DIR=/config \
     LANG=C.UTF-8
 

@@ -9,6 +9,7 @@ sys.path.insert(0, APP_DIR)
 
 TMP = tempfile.TemporaryDirectory()
 os.environ["DATA_DIR"] = os.path.join(TMP.name, "data")
+os.environ["DATA_RW_DIR"] = os.environ["DATA_DIR"]
 os.environ["CONFIG_DIR"] = os.path.join(TMP.name, "config")
 for folder in ("Documents", "Documents/2024", "Photos", "has \"quote\""):
     os.makedirs(os.path.join(os.environ["DATA_DIR"], folder))
@@ -63,6 +64,46 @@ class LsyncdConfigTest(unittest.TestCase):
         self.assertIn("init = false", conf)
         self.assertIn(f'ssh = {{ binary = "{server.SSH_WRAPPER}" }}', conf)
         self.assertEqual(conf.count("{"), conf.count("}"))
+
+
+class TwoWayTest(unittest.TestCase):
+    def test_twoway_must_be_a_selected_folder(self):
+        s, errors = server.validate({"folders": ["Documents", "Photos"], "twoway": ["Photos", "Elsewhere"]})
+        self.assertEqual((s["twoway"], errors), (["Photos"], []))
+
+    def test_twoway_needs_write_access(self):
+        old = server.DATA_RW_DIR
+        server.DATA_RW_DIR = "/does/not/exist"
+        try:
+            _, errors = server.validate({"folders": ["Photos"], "twoway": ["Photos"]})
+        finally:
+            server.DATA_RW_DIR = old
+        self.assertEqual(len(errors), 1)
+        self.assertIn("/data-rw", errors[0].replace("/does/not/exist", "/data-rw"))
+
+    def test_twoway_folders_are_left_out_of_lsyncd(self):
+        s, _ = server.validate({"host": "10.0.0.2", "folders": ["Documents", "Photos"], "twoway": ["Photos"]})
+        self.assertEqual(server.mirror_folders(s), ["Documents"])
+        self.assertEqual(server.twoway_folders(s), ["Photos"])
+        conf = server.build_lsyncd_conf(s, server.mirror_folders(s))
+        self.assertIn("Documents", conf)
+        self.assertNotIn("Photos", conf)
+
+    def test_unison_command(self):
+        s, _ = server.validate({
+            "host": "10.0.0.2", "folders": ["Photos"], "twoway": ["Photos"],
+            "excludes": ["*.tmp", "cache/", "/Downloads/", "a/b"],
+        })
+        cmd = server.build_unison_cmd(s, ["Photos"])
+        self.assertEqual(cmd[:3], ["unison", server.DATA_RW_DIR, "ssh://backup-target//backup"])
+        self.assertEqual(cmd[cmd.index("-path") + 1], "Photos")
+        for flag in ("-batch", "-copyonconflict", "-times", "-numericids"):
+            self.assertIn(flag, cmd)
+        self.assertEqual(cmd[cmd.index("-repeat") + 1], "watch")
+        self.assertEqual(cmd[cmd.index("-prefer") + 1], "newer")
+        self.assertEqual(cmd[cmd.index("-sshcmd") + 1], server.SSH_WRAPPER)
+        ignores = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "-ignore"]
+        self.assertEqual(ignores, ["Name *.tmp", "Name cache", "Path Photos/Downloads", "Path Photos/a/b"])
 
 
 class CountTest(unittest.TestCase):

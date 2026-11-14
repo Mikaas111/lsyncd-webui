@@ -7,10 +7,11 @@
   <Shell>sh</Shell>
   <Support>https://github.com/Mikaas111/lsyncd-webui/issues</Support>
   <Project>https://github.com/Mikaas111/lsyncd-webui</Project>
-  <Overview>Main server side of lsyncd-webui. Watches the folders you pick and mirrors every change to the backup server within seconds, with a web UI for progress, folder selection, excludes and file counts on both servers.</Overview>
+  <Overview>Main server side of lsyncd-webui. Watches the folders you pick and mirrors every change to the backup server within seconds, or syncs both ways for folders you choose, with a web UI for progress, folder selection, excludes and file counts on both servers.</Overview>
   <Category>Backup: Tools:Utilities</Category>
   <WebUI>http://[IP]:[PORT:8484]/</WebUI>
   <Config Name="Shares (read only)" Target="/data" Default="/mnt/user" Mode="ro" Description="Folders you can choose from in the web UI. Read only: the main server is never changed." Type="Path" Display="always" Required="true" Mask="false">/mnt/user</Config>
+  <Config Name="Shares (read-write, two-way folders)" Target="/data-rw" Default="/mnt/user" Mode="rw" Description="Only used for folders you set to two-way: changes made on the backup are written back here. Mirrored folders are never written." Type="Path" Display="always" Required="false" Mask="false">/mnt/user</Config>
   <Config Name="Config" Target="/config" Default="/mnt/user/appdata/lsyncd-webui" Mode="rw" Description="Settings, SSH key and status." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/lsyncd-webui</Config>
   <Config Name="Web UI port" Target="WEBUI_PORT" Default="8484" Mode="" Description="Port of the web UI (host network)." Type="Variable" Display="always" Required="true" Mask="false">8484</Config>
   <Config Name="Web UI password" Target="WEBUI_PASSWORD" Default="" Mode="" Description="Optional. When set, the web UI asks for it (any user name)." Type="Variable" Display="always" Required="false" Mask="true"></Config>

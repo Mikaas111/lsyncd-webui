@@ -7,6 +7,7 @@ needs nothing but Docker.
 """
 
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -17,6 +18,8 @@ HOST_KEY_DIR = os.path.join(CONFIG_DIR, "hostkeys")
 HOST_KEY = os.path.join(HOST_KEY_DIR, "ssh_host_ed25519_key")
 EXTRA_KEYS = os.path.join(CONFIG_DIR, "authorized_keys")
 AUTHORIZED_KEYS = "/etc/ssh/lsyncd_authorized_keys"
+UNISON_DIR = os.path.join(CONFIG_DIR, "unison")
+UNISON_HOME = "/root/.unison"
 SSHD_CONFIG = "/etc/ssh/sshd_config_lsyncd"
 
 
@@ -42,6 +45,13 @@ def main():
         subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", HOST_KEY], check=True)
         log("Created a new host key.")
     os.chmod(HOST_KEY, 0o600)
+
+    # Unison keeps its record of the last sync in ~/.unison; keep it in /config so it survives updates
+    os.makedirs(UNISON_DIR, exist_ok=True)
+    if not os.path.islink(UNISON_HOME):
+        if os.path.isdir(UNISON_HOME):
+            shutil.rmtree(UNISON_HOME)
+        os.symlink(UNISON_DIR, UNISON_HOME)
 
     keys = allowed_keys()
     with open(AUTHORIZED_KEYS, "w", encoding="utf-8") as f:

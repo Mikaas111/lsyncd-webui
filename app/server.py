@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """lsyncd-webui, main-server role.
 
-Keeps lsyncd running for the selected folders, runs full syncs, comparisons and
-counts on request or on a schedule, and serves a small web interface.
+Keeps lsyncd running for mirrored folders and Unison for two-way folders, runs
+full syncs, comparisons and counts on request or on a schedule, and serves a
+small web interface.
 Everything runs inside the container; the host only provides Docker and the
 mounted folders, so the host operating system does not matter.
 """
@@ -29,6 +30,8 @@ import count
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(APP_DIR, "static")
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
+# Same shares, mounted read-write; only two-way folders are ever written through it
+DATA_RW_DIR = os.environ.get("DATA_RW_DIR", "/data-rw")
 CONFIG_DIR = os.environ.get("CONFIG_DIR", "/config")
 PORT = int(os.environ.get("WEBUI_PORT", "8484"))
 PASSWORD = os.environ.get("WEBUI_PASSWORD", "")
@@ -40,6 +43,7 @@ KEY_FILE = os.path.join(SSH_DIR, "id_ed25519")
 KNOWN_HOSTS = os.path.join(SSH_DIR, "known_hosts")
 SSH_CONFIG = os.path.join(SSH_DIR, "config")
 LSYNCD_CONF = os.path.join(CONFIG_DIR, "lsyncd.conf.lua")
+UNISON_DIR = os.path.join(CONFIG_DIR, "unison")
 STATUS_FILE = os.environ.get("LSYNCD_STATUS_FILE", "/tmp/lsyncd.status")
 REMOTE_COUNT = os.environ.get("REMOTE_COUNT_SCRIPT", "/app/count.py")
 SSH_ALIAS = "backup-target"
@@ -57,6 +61,7 @@ DEFAULTS = {
     "user": "root",
     "target": "/backup",
     "folders": [],
+    "twoway": [],
     "excludes": [".Recycle.Bin/"],
     "delay": 5,
     "delete": True,
@@ -206,6 +211,16 @@ def validate(raw, check_folders=True):
         folders.add(folder)
     # A folder inside another selected folder is already covered by its parent
     s["folders"] = sorted(f for f in folders if not any(f.startswith(o + "/") for o in folders))
+
+    twoway = {clean_folder(item) for item in raw.get("twoway", []) or []}
+    s["twoway"] = sorted(f for f in twoway if f in s["folders"])
+    if check_folders:
+        for folder in s["twoway"]:
+            if not os.path.isdir(rw_dir(folder)) or not os.access(rw_dir(folder), os.W_OK):
+                errors.append(
+                    f"{folder} is set to two-way, but the container cannot write to it. "
+                    f"Add the path {DATA_RW_DIR} (your shares, read-write) to the container settings."
+                )
     return s, errors
 
 
@@ -222,8 +237,20 @@ def remote_dir(s, folder):
     return posixpath.join(s["target"], folder)
 
 
+def rw_dir(folder):
+    return os.path.join(DATA_RW_DIR, folder)
+
+
 def active_folders(s):
     return [f for f in s["folders"] if os.path.isdir(source_dir(f))]
+
+
+def mirror_folders(s):
+    return [f for f in active_folders(s) if f not in s["twoway"]]
+
+
+def twoway_folders(s):
+    return [f for f in s["twoway"] if os.path.isdir(rw_dir(f))]
 
 
 def read_int(path):
@@ -441,7 +468,44 @@ def child_count(parent_pid, name):
     return total
 
 
-class Lsyncd:
+def unison_ignores(excludes, folders):
+    """Translate rsync-style excludes into Unison ignore patterns."""
+    out = []
+    for raw in excludes:
+        pattern = raw.strip().rstrip("/")
+        if not pattern or pattern.startswith("#"):
+            continue
+        if "/" in pattern:
+            # Anchored to the selected folder; Unison paths start at the root, which holds the folders
+            out += [f"Path {folder}/{pattern.lstrip('/')}" for folder in folders]
+        else:
+            out.append(f"Name {pattern}")
+    return out
+
+
+def build_unison_cmd(s, folders):
+    cmd = ["unison", DATA_RW_DIR, f"ssh://{SSH_ALIAS}/{s['target']}"]
+    for folder in folders:
+        cmd += ["-path", folder]
+    cmd += [
+        "-batch", "-ui", "text",
+        "-repeat", "watch",
+        "-prefer", "newer", "-copyonconflict",
+        "-times", "-owner", "-group", "-numericids",
+        "-log=false",
+        "-sshcmd", SSH_WRAPPER,
+        "-servercmd", "unison",
+    ]
+    for pattern in unison_ignores(s["excludes"], folders):
+        cmd += ["-ignore", pattern]
+    return cmd
+
+
+class Daemon:
+    """A long-running sync process that is restarted when it exits."""
+
+    name = ""
+
     def __init__(self):
         self.lock = threading.RLock()
         self.proc = None
@@ -459,52 +523,59 @@ class Lsyncd:
         proc = self.proc
         return proc.pid if proc is not None and proc.poll() is None else None
 
+    def folders(self, s):
+        raise NotImplementedError
+
+    def command(self, s, folders):
+        raise NotImplementedError
+
+    def on_line(self, line):
+        raise NotImplementedError
+
+    def prepare(self, s, folders):
+        pass
+
+    def env(self):
+        return None
+
     def start(self, s):
         with self.lock:
             self._stop()
-            folders = active_folders(s)
+            folders = self.folders(s)
             if not s["host"] or not folders:
                 self.wanted = False
                 self.retry_at = None
                 return
             self.wanted = True
             self.retry_at = None
-            with open(LSYNCD_CONF, "w", encoding="utf-8") as f:
-                f.write(build_lsyncd_conf(s, folders))
+            self.prepare(s, folders)
             ensure_remote_dirs(s, folders)
             try:
-                os.remove(STATUS_FILE)
-            except OSError:
-                pass
-            try:
                 self.proc = subprocess.Popen(
-                    ["lsyncd", "-nodaemon", "-insist", LSYNCD_CONF],
+                    self.command(s, folders),
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
                     errors="replace",
                     bufsize=1,
+                    env=self.env(),
                 )
             except OSError as err:
-                self.last_error = f"lsyncd could not start: {err}"
-                log("lsyncd", self.last_error)
+                self.last_error = f"{self.name} could not start: {err}"
+                log(self.name, self.last_error)
                 self.retry_at = time.time() + 60
                 return
             self.started_at = time.time()
             self.last_error = ""
-            log("lsyncd", f"Started for {len(folders)} folder(s).")
+            log(self.name, f"Started for {len(folders)} folder(s).")
             threading.Thread(target=self._read, args=(self.proc,), daemon=True).start()
 
     def _read(self, proc):
         for line in proc.stdout:
             line = line.rstrip()
-            if not line:
-                continue
-            log("lsyncd", line)
-            if re.search(r"\bError\b", line):
-                self.last_error = line
-            elif "Normal:" in line and "Startup" not in line:
-                self.last_activity = time.time()
+            if line:
+                log(self.name, line)
+                self.on_line(line)
 
     def _stop(self):
         proc, self.proc = self.proc, None
@@ -534,11 +605,67 @@ class Lsyncd:
                     self.proc = None
                     self.retry_at = time.time() + 30
                     if not self.last_error:
-                        self.last_error = f"lsyncd stopped unexpectedly (code {proc.returncode})."
-                    log("lsyncd", f"Exited with code {proc.returncode}; retrying in 30 seconds.")
+                        self.last_error = f"{self.name} stopped unexpectedly (code {proc.returncode})."
+                    log(self.name, f"Exited with code {proc.returncode}; retrying in 30 seconds.")
                     continue
                 if self.retry_at and time.time() >= self.retry_at:
                     self.start(load_settings())
+
+
+class Lsyncd(Daemon):
+    """One-way mirror of the folders that are not two-way."""
+
+    name = "lsyncd"
+
+    def folders(self, s):
+        return mirror_folders(s)
+
+    def prepare(self, s, folders):
+        with open(LSYNCD_CONF, "w", encoding="utf-8") as f:
+            f.write(build_lsyncd_conf(s, folders))
+        try:
+            os.remove(STATUS_FILE)
+        except OSError:
+            pass
+
+    def command(self, s, folders):
+        return ["lsyncd", "-nodaemon", "-insist", LSYNCD_CONF]
+
+    def on_line(self, line):
+        if re.search(r"\bError\b", line):
+            self.last_error = line
+        elif "Normal:" in line and "Startup" not in line:
+            self.last_activity = time.time()
+
+
+class Unison(Daemon):
+    """Two-way sync of the folders marked two-way, watching both servers for changes."""
+
+    name = "unison"
+
+    def __init__(self):
+        super().__init__()
+        self.last_result = ""
+
+    def folders(self, s):
+        return twoway_folders(s)
+
+    def prepare(self, s, folders):
+        os.makedirs(UNISON_DIR, exist_ok=True)
+
+    def env(self):
+        return {**os.environ, "UNISON": UNISON_DIR}
+
+    def command(self, s, folders):
+        return build_unison_cmd(s, folders)
+
+    def on_line(self, line):
+        if line.startswith("Synchronization complete") or line.startswith("Nothing to do"):
+            self.last_activity = time.time()
+            self.last_result = line
+            self.last_error = ""
+        elif line.startswith("Fatal error") or line.startswith("Error") or "failed:" in line:
+            self.last_error = line
 
 
 # ---------------------------------------------------------------------------
@@ -665,6 +792,13 @@ class Jobs:
         self.set(**changes)
 
     def _full(self, s, folders):
+        twoway = [f for f in folders if f in s["twoway"]]
+        if twoway:
+            # Never rsync --delete a two-way folder: it would remove files that are new on the backup.
+            # Restarting Unison makes it compare both sides in full instead.
+            log("task", f"Two-way folders are reconciled by Unison: {', '.join(twoway)}")
+            unison.start(s)
+        folders = [f for f in folders if f not in s["twoway"]]
         ensure_remote_dirs(s, folders)
         problems = []
         for index, folder in enumerate(folders, 1):
@@ -695,7 +829,9 @@ class Jobs:
         elif problems:
             ok, message = False, "Not completed: " + ", ".join(problems)
         else:
-            ok, message = True, f"Done: {len(folders)} folder(s) in sync."
+            ok, message = True, f"Done: {len(folders)} mirrored folder(s) in sync."
+            if twoway:
+                message += f" Unison is comparing {len(twoway)} two-way folder(s)."
         update_state(last_full={"time": time.time(), "ok": ok, "message": message})
         return ok, message
 
@@ -707,7 +843,7 @@ class Jobs:
             self.set(folder=folder, index=index, phase="Comparing",
                      percent=int((index - 1) / len(folders) * 100))
             cmd = rsync_base(s) + ["--omit-dir-times", "--dry-run", "--itemize-changes"]
-            if s["delete"]:
+            if s["delete"] or folder in s["twoway"]:  # dry run only: lists files that exist only on the backup
                 cmd.append("--delete")
             cmd += [source_dir(folder) + "/", f"{SSH_ALIAS}:{remote_dir(s, folder)}/"]
             found = []
@@ -758,6 +894,7 @@ class Jobs:
 
 
 lsyncd = Lsyncd()
+unison = Unison()
 jobs = Jobs()
 
 
@@ -783,10 +920,12 @@ def apply_settings(new):
     write_json(SETTINGS_FILE, new)
     write_ssh_config(new)
     lsyncd.start(new)
+    unison.start(new)
     message = "Saved."
     connection_changed = any(old[k] != new[k] for k in CONNECTION_KEYS)
     added = [f for f in new["folders"] if f not in old["folders"]]
-    run = active_folders(new) if connection_changed else [f for f in added if os.path.isdir(source_dir(f))]
+    # Unison already compares two-way folders in full when it (re)starts
+    run = mirror_folders(new) if connection_changed else [f for f in added if f in mirror_folders(new)]
     if new["host"] and run:
         ok, _ = jobs.start("full", run)
         message += " A full sync has started." if ok else " Start a full sync once the current task is done."
@@ -843,6 +982,15 @@ def status_payload():
         "time": time.time(),
         "configured": bool(s["host"] and s["folders"]),
         "settings": {"host": s["host"], "delay": s["delay"], "nightly": s["nightly"], "delete": s["delete"]},
+        "unison": {
+            "folders": s["twoway"],
+            "running": unison.running(),
+            "wanted": unison.wanted,
+            "since": unison.started_at,
+            "last_activity": unison.last_activity,
+            "last_result": unison.last_result,
+            "last_error": unison.last_error,
+        },
         "lsyncd": {
             "running": lsyncd.running(),
             "wanted": lsyncd.wanted,
@@ -859,7 +1007,8 @@ def status_payload():
         "last_compare": compare,
         "counts": state.get("counts"),
         "folders": [
-            {"path": f, "exists": os.path.isdir(source_dir(f)), "target": remote_dir(s, f)}
+            {"path": f, "exists": os.path.isdir(source_dir(f)), "target": remote_dir(s, f),
+             "mode": "twoway" if f in s["twoway"] else "mirror"}
             for f in s["folders"]
         ],
     }
@@ -916,7 +1065,10 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/api/status":
             self._send(200, status_payload())
         elif url.path == "/api/config":
-            self._send(200, {"settings": load_settings(), "public_key": public_key(), "data_dir": DATA_DIR})
+            self._send(200, {
+                "settings": load_settings(), "public_key": public_key(), "data_dir": DATA_DIR,
+                "rw_available": os.path.isdir(DATA_RW_DIR) and os.access(DATA_RW_DIR, os.W_OK),
+            })
         elif url.path == "/api/browse":
             self._send(200, browse(query.get("path", [""])[0]))
         elif url.path == "/api/compare":
@@ -977,6 +1129,7 @@ class Handler(BaseHTTPRequestHandler):
                     pass
             ensure_key()
             lsyncd.start(load_settings())
+            unison.start(load_settings())
             self._send(200, {"ok": True, "public_key": public_key()})
         else:
             self._send(404, {"error": "Not found"})
@@ -999,7 +1152,8 @@ def test_connection():
 
 def startup(settings):
     lsyncd.start(settings)
-    if settings["host"] and active_folders(settings):
+    unison.start(settings)
+    if settings["host"] and mirror_folders(settings):
         jobs.start("full")
 
 
@@ -1012,6 +1166,7 @@ def main():
     write_ssh_config(settings)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     threading.Thread(target=lsyncd.watchdog, daemon=True).start()
+    threading.Thread(target=unison.watchdog, daemon=True).start()
     threading.Thread(target=scheduler, daemon=True).start()
     threading.Thread(target=startup, args=(settings,), daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
@@ -1022,6 +1177,7 @@ def main():
     finally:
         jobs.stop()
         lsyncd.stop()
+        unison.stop()
 
 
 if __name__ == "__main__":

@@ -96,6 +96,7 @@ textarea { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace
 .selected-list { list-style: none; padding: 0; margin: 0; }
 .selected-list li { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--line); }
 .selected-list li .grow { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+select { font: inherit; font-size: 13px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 14px; }
 .chip { font: inherit; font-size: 13px; padding: 3px 10px; border: 1px dashed var(--line); border-radius: 999px; background: none; color: var(--text); cursor: pointer; }
 .chip:hover { border-color: var(--accent); }
@@ -134,12 +135,22 @@ details summary { cursor: pointer; color: var(--accent); font-size: 14px; }
 
     <div class="card">
       <h2>Live sync</h2>
-      <p class="lead">lsyncd watches the selected folders and sends every change to the backup server.</p>
+      <p class="lead">lsyncd watches the mirrored folders and sends every change to the backup server.</p>
       <div class="tiles">
         <div class="tile"><div class="k">Status</div><div class="v" id="t-state">–</div><div class="s" id="t-state-s"></div></div>
         <div class="tile"><div class="k">Waiting to be sent</div><div class="v" id="t-queue">–</div><div class="s" id="t-queue-s"></div></div>
         <div class="tile"><div class="k">Watched folders</div><div class="v" id="t-watch">–</div><div class="s" id="t-watch-s"></div></div>
         <div class="tile"><div class="k">Last change sent</div><div class="v" id="t-last">–</div><div class="s" id="t-last-s"></div></div>
+      </div>
+    </div>
+
+    <div class="card" id="twoway-card" hidden>
+      <h2>Two-way sync</h2>
+      <p class="lead">Unison keeps these folders the same on both servers. A change on either side is copied to the other. When a file changed on both sides, the newest version wins and the other is kept as a conflict copy next to it.</p>
+      <div class="tiles">
+        <div class="tile"><div class="k">Status</div><div class="v" id="u-state">–</div><div class="s" id="u-state-s"></div></div>
+        <div class="tile"><div class="k">Two-way folders</div><div class="v" id="u-folders">–</div><div class="s" id="u-folders-s"></div></div>
+        <div class="tile"><div class="k">Last sync</div><div class="v" id="u-last">–</div><div class="s" id="u-last-s"></div></div>
       </div>
     </div>
 
@@ -175,10 +186,11 @@ details summary { cursor: pointer; color: var(--accent); font-size: 14px; }
   <section id="tab-folders" hidden>
     <div class="card">
       <div class="row spread">
-        <h2>Folders to mirror</h2>
+        <h2>Folders to sync</h2>
         <div class="row"><span class="unsaved" id="folders-dirty" hidden>Unsaved changes</span><button class="btn primary" id="save-folders">Save</button></div>
       </div>
-      <p class="lead">Tick the folders that must be on the backup. A ticked folder includes everything inside it. Removing a folder here stops syncing it; its copy on the backup stays.</p>
+      <p class="lead">Tick the folders that must be on the backup. A ticked folder includes everything inside it. Per folder, choose <b>Mirror</b> (the main server decides, the backup follows) or <b>Two-way</b> (changes on either server are copied to the other). Removing a folder here stops syncing it; its copy on the backup stays.</p>
+      <p class="small" id="rw-warning" hidden style="color:var(--warn)">Two-way needs write access on the main server. Add the path <code>/data-rw</code> (your shares, read-write) to this container's settings first.</p>
       <div class="grid2">
         <div>
           <div class="small muted" style="margin-bottom:6px">On the main server</div>
@@ -273,7 +285,7 @@ details summary { cursor: pointer; color: var(--accent); font-size: 14px; }
 const $ = (sel, el = document) => el.querySelector(sel);
 const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
 const nf = new Intl.NumberFormat("en-US");
-const app = { config: null, status: null, selected: new Set(), logSeq: 0, tab: "overview" };
+const app = { config: null, status: null, selected: new Set(), twoway: new Set(), rwAvailable: false, logSeq: 0, tab: "overview" };
 
 async function api(path, options = {}) {
   const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...options });
@@ -333,9 +345,12 @@ function bannerFor(st) {
     const where = job.folder ? ` (folder ${job.index} of ${job.total}: ${job.folder})` : "";
     return ["busy", `${job.name} in progress`, (job.phase || "Working") + where + ". Live sync keeps running meanwhile."];
   }
+  const u = st.unison;
   if (l.wanted && !l.running) return ["bad", "Live sync is not running", l.last_error || "lsyncd stopped. It restarts automatically."];
+  if (u.wanted && !u.running) return ["bad", "Two-way sync is not running", u.last_error || "Unison stopped. It restarts automatically."];
+  if (u.running && u.last_error) return ["warn", "Two-way sync reported a problem", u.last_error];
   if (st.last_full && !st.last_full.ok) return ["warn", "Last full sync did not complete", st.last_full.message];
-  if (l.running) return ["good", "Live: backup follows the main server", `Changes reach the backup within about ${st.settings.delay} seconds.`];
+  if (l.running || u.running) return ["good", "Live: backup follows the main server", `Changes reach the other server within seconds.`];
   return ["muted", "Stopped", ""];
 }
 
@@ -350,7 +365,19 @@ function renderOverview(st) {
 
   const l = st.lsyncd;
   $("#t-state").textContent = l.running ? "Running" : "Stopped";
-  $("#t-state-s").textContent = l.running ? "since " + stamp(l.since) : (l.last_error || "");
+  const mirrored = st.folders.filter(f => f.mode === "mirror").length;
+  $("#t-state-s").textContent = l.running ? "since " + stamp(l.since) : (l.last_error || (st.configured && !mirrored ? "no mirrored folders" : ""));
+
+  const u = st.unison;
+  $("#twoway-card").hidden = !u.folders.length;
+  if (u.folders.length) {
+    $("#u-state").textContent = u.running ? "Running" : "Stopped";
+    $("#u-state-s").textContent = u.running ? "since " + stamp(u.since) : (u.last_error || "");
+    $("#u-folders").textContent = num(u.folders.length);
+    $("#u-folders-s").textContent = u.folders.join(", ");
+    $("#u-last").textContent = ago(u.last_activity);
+    $("#u-last-s").textContent = u.last_result || "";
+  }
   $("#t-queue").textContent = l.running ? num(l.queue ?? 0) : "–";
   $("#t-queue-s").textContent = l.busy ? "sending now" : (l.running ? "nothing in transit" : "");
   $("#t-watch").textContent = num(l.watching);
@@ -436,7 +463,8 @@ function renderCounts(st) {
       total.m[k] += m[k] || 0;
       total.b[k] += (b && b[k]) || 0;
     }
-    rows.push(`<tr><td>${esc(folder)}</td>
+    const twoway = st.folders.some(f => f.path === folder && f.mode === "twoway");
+    rows.push(`<tr><td>${esc(folder)}${twoway ? ` <span class="badge tone-busy">two-way</span>` : ""}</td>
       <td class="n">${num(m.dirs)}</td><td class="n">${num(m.files)}</td><td class="n">${bytes(m.bytes)}</td>
       <td class="n">${num(b && b.dirs)}</td><td class="n">${num(b && b.files)}</td><td class="n">${bytes(b && b.bytes)}</td>
       <td><span class="badge tone-${tone}">${esc(label)}</span></td></tr>`);
@@ -542,9 +570,9 @@ function treeNode(d) {
   });
   box.addEventListener("change", () => {
     if (box.checked) {
-      for (const s of [...app.selected]) if (s.startsWith(d.path + "/")) app.selected.delete(s);
+      for (const s of [...app.selected]) if (s.startsWith(d.path + "/")) { app.selected.delete(s); app.twoway.delete(s); }
       app.selected.add(d.path);
-    } else app.selected.delete(d.path);
+    } else { app.selected.delete(d.path); app.twoway.delete(d.path); }
     markDirty("#folders-dirty");
     syncTree();
     renderSelected();
@@ -564,10 +592,25 @@ function renderSelected() {
   const list = $("#selected");
   const target = (app.config && app.config.target) || "/backup";
   const items = [...app.selected].sort();
+  $("#rw-warning").hidden = app.rwAvailable || !app.twoway.size;
   if (!items.length) { list.innerHTML = `<li class="muted small">Nothing selected yet.</li>`; return; }
-  list.innerHTML = items.map(p => `<li><div class="grow"><b>${esc(p)}</b><div class="small muted">→ ${esc(target.replace(/\/$/, "") + "/" + p)}</div></div><button class="btn" data-remove="${esc(p)}">Remove</button></li>`).join("");
+  list.innerHTML = items.map(p => {
+    const two = app.twoway.has(p);
+    return `<li><div class="grow"><b>${esc(p)}</b><div class="small muted">${two ? "⇄" : "→"} ${esc(target.replace(/\/$/, "") + "/" + p)}</div></div>
+      <select data-mode="${esc(p)}" aria-label="Sync mode for ${esc(p)}">
+        <option value="mirror"${two ? "" : " selected"}>Mirror</option>
+        <option value="twoway"${two ? " selected" : ""}>Two-way</option>
+      </select>
+      <button class="btn" data-remove="${esc(p)}">Remove</button></li>`;
+  }).join("");
+  $$("[data-mode]", list).forEach(sel => sel.addEventListener("change", () => {
+    if (sel.value === "twoway") app.twoway.add(sel.dataset.mode); else app.twoway.delete(sel.dataset.mode);
+    markDirty("#folders-dirty");
+    renderSelected();
+  }));
   $$("[data-remove]", list).forEach(b => b.addEventListener("click", () => {
     app.selected.delete(b.dataset.remove);
+    app.twoway.delete(b.dataset.remove);
     markDirty("#folders-dirty");
     syncTree();
     renderSelected();
@@ -617,6 +660,7 @@ async function save(changes, dirtyId) {
     const res = await post("/api/config", body);
     app.config = res.settings;
     app.selected = new Set(app.config.folders);
+    app.twoway = new Set(app.config.twoway);
     markDirty(dirtyId, false);
     toast(res.message);
     syncTree();
@@ -626,7 +670,7 @@ async function save(changes, dirtyId) {
     toast(e.message, true);
   }
 }
-$("#save-folders").addEventListener("click", () => save({ folders: [...app.selected] }, "#folders-dirty"));
+$("#save-folders").addEventListener("click", () => save({ folders: [...app.selected], twoway: [...app.twoway].filter(p => app.selected.has(p)) }, "#folders-dirty"));
 $("#save-excludes").addEventListener("click", () => save({ excludes: $("#excludes").value.split("\n").map(s => s.trim()).filter(Boolean) }, "#excludes-dirty"));
 $("#save-settings").addEventListener("click", () => save(readSettings(), "#settings-dirty"));
 
@@ -699,6 +743,8 @@ async function init() {
   const data = await api("/api/config");
   app.config = data.settings;
   app.selected = new Set(app.config.folders);
+  app.twoway = new Set(app.config.twoway || []);
+  app.rwAvailable = !!data.rw_available;
   fillSettings(app.config);
   $("#excludes").value = app.config.excludes.join("\n");
   $("#pubkey").value = data.public_key;
