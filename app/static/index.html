@@ -108,6 +108,10 @@ details summary { cursor: pointer; color: var(--accent); font-size: 14px; }
 .toast.error { background: var(--bad); color: #fff; }
 .unsaved { color: var(--warn); font-size: 13px; font-weight: 600; }
 .keybox { width: 100%; height: 70px; resize: none; }
+.tiles.transfer { grid-template-columns: minmax(150px, 1fr) minmax(0, 2.6fr) minmax(150px, 1fr); }
+@media (max-width: 640px) { .tiles.transfer { grid-template-columns: 1fr; } }
+.tile .v.path { font-size: 15px; font-weight: 600; margin-top: 6px; overflow-wrap: anywhere; }
+.tips { margin: 12px 0 0; padding: 10px 12px; border-radius: 10px; background: var(--code); font-size: 14px; }
 </style>
 </head>
 <body>
@@ -132,6 +136,16 @@ details summary { cursor: pointer; color: var(--accent); font-size: 14px; }
   <!-- Overview -->
   <section id="tab-overview">
     <div id="banner" class="card banner"><h2>Loading…</h2><p></p></div>
+
+    <div class="card">
+      <h2>Transfer</h2>
+      <p class="lead">What goes between the servers right now, updated every 2 seconds. A file only shows up here once it has been copied in full.</p>
+      <div class="tiles transfer">
+        <div class="tile"><div class="k">Speed now</div><div class="v" id="x-speed">–</div><div class="s" id="x-speed-s"></div></div>
+        <div class="tile"><div class="k">Last file copied</div><div class="v path" id="x-file">–</div><div class="s" id="x-file-s"></div></div>
+        <div class="tile"><div class="k">Files copied</div><div class="v" id="x-files">–</div><div class="s">since the container started</div></div>
+      </div>
+    </div>
 
     <div class="card">
       <h2>Live sync</h2>
@@ -266,6 +280,15 @@ details summary { cursor: pointer; color: var(--accent); font-size: 14px; }
       </div>
       <div id="ssh-result" class="small" style="margin-top:10px"></div>
     </div>
+
+    <div class="card">
+      <div class="row spread">
+        <h2>Speed test</h2>
+        <button class="btn" data-job="speed">Run speed test</button>
+      </div>
+      <p class="lead">Measures each link between the servers on its own, so you can see what limits the sync: the network, SSH encryption or the disks of the backup server. Takes about half a minute and writes a 1 GB test file on the backup, which is deleted right after. The fastest encryption it finds is used for all syncs from then on.</p>
+      <div id="speed"></div>
+    </div>
   </section>
 
   <!-- Log -->
@@ -314,6 +337,8 @@ function ago(ts) {
   if (s < 86400) return Math.round(s / 3600) + " h ago";
   return new Date(ts * 1000).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 }
+const mbs = b => (b / 1e6).toFixed(b >= 100e6 ? 0 : 1) + " MB/s";
+const mbit = b => Math.round(b * 8 / 1e6) + " Mbit/s";
 const stamp = ts => (ts ? new Date(ts * 1000).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }) : "–");
 
 let toastTimer;
@@ -387,15 +412,67 @@ function renderOverview(st) {
   $("#t-last").textContent = ago(l.last_activity);
   $("#t-last-s").textContent = l.last_activity ? stamp(l.last_activity) : "";
 
+  renderTransfer(st);
   renderJob(st);
+  renderSpeed(st);
   renderCounts(st);
   renderCompare(st);
+}
+
+function renderTransfer(st) {
+  const x = st.transfer;
+  if (!x) return;
+  $("#x-speed").textContent = mbs(x.speed);
+  $("#x-speed-s").textContent = x.speed >= 10e3 ? mbit(x.speed) : "idle";
+  const f = x.last_file;
+  $("#x-file").textContent = f ? f.path : "–";
+  if (f) {
+    const s = Math.max(0, Math.round(st.time - f.time));
+    const when = s < 90 ? `${s} s ago` : ago(f.time);
+    const dir = f.direction === "to main" ? "backup → main" : "main → backup";
+    $("#x-file-s").textContent = [f.size != null ? bytes(f.size) : "", dir, when].filter(Boolean).join(" · ");
+  } else {
+    $("#x-file-s").textContent = "Nothing copied since the container started.";
+  }
+  $("#x-files").textContent = num(x.files);
+}
+
+const BOTTLENECK = {
+  disk: "Writing on the backup server is the slowest link. On Unraid, set <b>Settings → Disk Settings → Tunable (md_write_method)</b> to <b>reconstruct write</b> (also called turbo write). Array writes then skip reading parity first, which is often much faster; all disks spin while writing. A cache pool for the backup share helps too.",
+  encryption: "SSH encryption is the slowest link: one of the servers runs out of CPU time for it. The fastest cipher it found is now used for all syncs.",
+  network: "The network between the servers is the slowest link. The main server's upload and the backup's download both count, so check both internet connections, for example with a speed test site at each location. If both are clearly faster than this, a lower MTU on the VPN tunnel (such as 1380, on both ends) sometimes helps.",
+};
+
+function renderSpeed(st) {
+  const box = $("#speed"), job = st.job;
+  if (job && job.kind === "speed" && job.state === "running") {
+    box.innerHTML = `<div class="bar"><div style="width:${Math.max(2, job.percent)}%"></div></div><div class="small muted">${esc(job.phase)}…</div>`;
+    return;
+  }
+  const r = st.speedtest;
+  let html = "";
+  if (job && job.kind === "speed" && job.state === "failed") html += `<p class="small" style="color:var(--bad);margin:0 0 10px">${esc(job.message)}</p>`;
+  if (!r) { box.innerHTML = html + `<span class="muted small">Not tested yet.</span>`; return; }
+  const rows = [["Network without SSH", r.network || {}, "Internet and VPN between the servers, nothing else"]];
+  for (const c of r.ciphers || []) rows.push([`SSH with <code>${esc(c.name)}</code>${c.name === r.cipher ? ` <span class="badge tone-good">used</span>` : ""}`, c, "Network plus encryption on both servers"]);
+  if (r.disk) rows.push(["Disk writes on the backup", r.disk, "Writing to the backup folder, including flushing to disk"]);
+  const slowest = Math.min(...[r.disk && r.disk.bps, Math.max(0, ...(r.ciphers || []).map(c => c.bps || 0))].filter(Boolean));
+  html += `<div class="table-wrap"><table><tr><th>Test</th><th class="n">Speed</th><th>Measures</th></tr>` + rows.map(([name, m, what]) =>
+    `<tr><td>${name}</td><td class="n">${m.bps ? `<b>${mbs(m.bps)}</b><div class="small muted">${mbit(m.bps)}</div>` : `<span style="color:var(--bad)">${esc(m.error || "–")}</span>`}</td><td class="small muted">${what}</td></tr>`
+  ).join("") + `</table></div>`;
+  if (r.bottleneck) html += `<div class="tips"><b>At most about ${mbs(slowest)} (${mbit(slowest)}).</b> ${BOTTLENECK[r.bottleneck]}</div>`;
+  const cpu = (label, c) => c ? `${label}: ${esc(c.model || "unknown CPU")}${c.cores ? `, ${c.cores} threads` : ""}, AES-NI ${c.aes ? "yes" : "no"}` : "";
+  const foot = [`Tested ${stamp(r.time)}`, cpu("Main", r.cpu && r.cpu.main), cpu("Backup", r.cpu && r.cpu.backup)].filter(Boolean);
+  if (r.busy) foot.push(`<span style="color:var(--warn)">A sync was running during the test, so the numbers may be low.</span>`);
+  foot.push("Many small files go slower than these numbers, because every file costs a few round trips.");
+  html += `<p class="small muted" style="margin:10px 0 0">${foot.join("<br>")}</p>`;
+  box.innerHTML = html;
 }
 
 function renderJob(st) {
   const job = st.job;
   const running = job && job.state === "running";
-  $$("[data-job]").forEach(b => (b.disabled = running || !st.configured));
+  $$("[data-job]").forEach(b => (b.disabled = running || (b.dataset.job === "speed" ? !st.settings.host : !st.configured)));
   $("#job-stop").hidden = !running;
   const body = $("#job-body");
   if (!job) {

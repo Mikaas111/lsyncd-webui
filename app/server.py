@@ -26,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import count
+import speedtest
 
 def first_dir(env_name, candidates):
     """The environment variable if set, else the first candidate that exists."""
@@ -85,6 +86,13 @@ CONNECTION_KEYS = ("host", "port", "user", "target")
 HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$")
 USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+CIPHER_RE = re.compile(r"^[a-z0-9@.-]{1,64}$")
+# rsync prints this line per item, and for a file only once it has been sent completely
+# (%b makes rsync log at the end of each transfer). The number after @lsw@ is the lsyncd sync.
+OUT_FORMAT = "--out-format=@lsw@{} %i %l %b %n"
+FILE_RE = re.compile(r"^@lsw@(\d*) (\S)(\S)\S*\s+(\d+) \d+ (.*)$")
+UNISON_BGN_RE = re.compile(r"^\[BGN\] (?:Copying|Updating file) (.+) from (\S+) to (\S+)$")
+UNISON_END_RE = re.compile(r"^\[END\] (?:Copying|Updating file) (.+)$")
 PROGRESS_RE = re.compile(
     r"^\s*([\d.,]+)\s+(\d+)%\s+(\S+)\s+(\d+:\d\d:\d\d)"
     r"(?:\s+\((?:xfr#\d+,\s*)?(?:ir|to)-chk=(\d+)/(\d+)\))?"
@@ -325,8 +333,12 @@ def write_ssh_config(s):
         "    ConnectTimeout 15",
         "    ServerAliveInterval 30",
         "    ServerAliveCountMax 4",
-        "",
     ]
+    cipher = (load_state().get("speedtest") or {}).get("cipher") or ""
+    if CIPHER_RE.match(cipher):
+        # Tried first; the default list stays behind it in case the server does not offer it
+        lines.append(f"    Ciphers ^{cipher}")
+    lines.append("")
     with open(SSH_CONFIG, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     os.chmod(SSH_CONFIG, 0o600)
@@ -441,8 +453,8 @@ def build_lsyncd_conf(s, folders):
         "}",
         "",
     ]
-    extra = [f"--bwlimit={s['bwlimit']}"] if s["bwlimit"] else []
-    for folder in folders:
+    for index, folder in enumerate(folders):
+        extra = [OUT_FORMAT.format(index)] + ([f"--bwlimit={s['bwlimit']}"] if s["bwlimit"] else [])
         out += [
             "sync {",
             "    default.rsyncssh,",
@@ -459,8 +471,7 @@ def build_lsyncd_conf(s, folders):
             "        archive = true,",
             f"        compress = {'true' if s['compress'] else 'false'},",
         ]
-        if extra:
-            out.append("        _extra = { " + ", ".join(lua(e) for e in extra) + " },")
+        out.append("        _extra = { " + ", ".join(lua(e) for e in extra) + " },")
         out += ["    },", "}", ""]
     return "\n".join(out)
 
@@ -532,6 +543,89 @@ def build_unison_cmd(s, folders):
     return cmd
 
 
+class Transfer:
+    """Live transfer speed and the last file that reached the other server completely.
+
+    The speed is what this container's ssh processes write (to the network, and
+    what they receive from it), sampled every second. A transfer that starts
+    and ends between two samples is missed, so it is an indication.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.seen = None  # (pid, start time) -> bytes written so far
+        self.total = 0
+        self.samples = collections.deque(maxlen=4)
+        self.last_file = None
+        self.files = 0
+        self.started = time.time()
+
+    def file_done(self, path, size, direction="to backup"):
+        with self.lock:
+            self.last_file = {"path": path, "size": size, "time": time.time(), "direction": direction}
+            self.files += 1
+
+    def sample(self):
+        counters = ssh_counters()
+        with self.lock:
+            if self.seen is not None:
+                self.total += sum(max(0, n - self.seen.get(key, 0)) for key, n in counters.items())
+            self.seen = counters
+            self.samples.append((time.monotonic(), self.total))
+
+    def speed(self):
+        with self.lock:
+            if len(self.samples) < 2:
+                return 0
+            (t0, b0), (t1, b1) = self.samples[0], self.samples[-1]
+        return (b1 - b0) / (t1 - t0) if t1 > t0 else 0
+
+    def snapshot(self):
+        speed = self.speed()
+        with self.lock:
+            return {"speed": speed, "last_file": self.last_file, "files": self.files, "since": self.started}
+
+    def run(self):
+        while True:
+            try:
+                self.sample()
+            except Exception as err:  # never let the sampler die
+                log("app", f"Transfer monitor: {err}")
+            time.sleep(1)
+
+
+def ssh_counters():
+    """Bytes written so far by each running ssh process."""
+    out = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat", encoding="utf-8", errors="replace") as f:
+                stat = f.read()
+            if stat[stat.find("(") + 1:stat.rfind(")")] != "ssh":
+                continue
+            started = stat[stat.rfind(")") + 2:].split()[19]
+            with open(f"/proc/{entry}/io", encoding="utf-8") as f:
+                wchar = next(int(l.split()[1]) for l in f if l.startswith("wchar:"))
+        except (OSError, ValueError, IndexError, StopIteration):
+            continue
+        out[(entry, started)] = wchar
+    return out
+
+
+def rsync_file_line(line, folder_for):
+    """Record a file rsync reports as sent completely. True if the line was such a report."""
+    match = FILE_RE.match(line)
+    if not match:
+        return False
+    index, kind, ftype, size, name = match.groups()
+    if kind in "<>" and ftype == "f":
+        folder = folder_for(index)
+        transfer.file_done(f"{folder}/{name}" if folder else name, int(size))
+    return True
+
+
 class Daemon:
     """A long-running sync process that is restarted when it exits."""
 
@@ -561,6 +655,7 @@ class Daemon:
         raise NotImplementedError
 
     def on_line(self, line):
+        """Handle a line of output. Return True to keep it out of the log."""
         raise NotImplementedError
 
     def prepare(self, s, folders):
@@ -604,9 +699,8 @@ class Daemon:
     def _read(self, proc):
         for line in proc.stdout:
             line = line.rstrip()
-            if line:
+            if line and not self.on_line(line):
                 log(self.name, line)
-                self.on_line(line)
 
     def _stop(self):
         proc, self.proc = self.proc, None
@@ -648,10 +742,15 @@ class Lsyncd(Daemon):
 
     name = "lsyncd"
 
+    def __init__(self):
+        super().__init__()
+        self.synced = []
+
     def folders(self, s):
         return mirror_folders(s)
 
     def prepare(self, s, folders):
+        self.synced = list(folders)
         with open(LSYNCD_CONF, "w", encoding="utf-8") as f:
             f.write(build_lsyncd_conf(s, folders))
         try:
@@ -663,10 +762,17 @@ class Lsyncd(Daemon):
         return ["lsyncd", "-nodaemon", "-insist", LSYNCD_CONF]
 
     def on_line(self, line):
+        if rsync_file_line(line, self.folder_for):
+            return True
         if re.search(r"\bError\b", line):
             self.last_error = line
         elif "Normal:" in line and "Startup" not in line:
             self.last_activity = time.time()
+        return False
+
+    def folder_for(self, index):
+        synced = self.synced
+        return synced[int(index)] if index.isdigit() and int(index) < len(synced) else ""
 
 
 class Unison(Daemon):
@@ -677,6 +783,7 @@ class Unison(Daemon):
     def __init__(self):
         super().__init__()
         self.last_result = ""
+        self.pending = {}  # path -> direction, from [BGN] until [END]
 
     def folders(self, s):
         return twoway_folders(s)
@@ -691,19 +798,33 @@ class Unison(Daemon):
         return build_unison_cmd(s, folders)
 
     def on_line(self, line):
+        begin = UNISON_BGN_RE.match(line)
+        if begin:
+            if len(self.pending) > 1000:
+                self.pending.clear()
+            self.pending[begin.group(1)] = "to main" if begin.group(2).startswith("//") else "to backup"
+        end = UNISON_END_RE.match(line)
+        if end:
+            path = end.group(1)
+            try:
+                size = os.path.getsize(rw_dir(path)) if os.path.isfile(rw_dir(path)) else None
+            except OSError:
+                size = None
+            transfer.file_done(path, size, self.pending.pop(path, "to backup"))
         if line.startswith("Synchronization complete") or line.startswith("Nothing to do"):
             self.last_activity = time.time()
             self.last_result = line
             self.last_error = ""
         elif line.startswith("Fatal error") or line.startswith("Error") or "failed:" in line:
             self.last_error = line
+        return False
 
 
 # ---------------------------------------------------------------------------
-# Jobs: full sync, compare, count
+# Jobs: full sync, compare, count, speed test
 # ---------------------------------------------------------------------------
 
-JOB_NAMES = {"full": "Full sync", "compare": "Compare", "count": "Count"}
+JOB_NAMES = {"full": "Full sync", "compare": "Compare", "count": "Count", "speed": "Speed test"}
 
 
 class Jobs:
@@ -735,7 +856,9 @@ class Jobs:
                 return False, "Set the backup server address first."
             wanted = folders if folders is not None else s["folders"]
             todo = [f for f in wanted if f in s["folders"] and os.path.isdir(source_dir(f))]
-            if not todo:
+            if kind == "speed":
+                todo = []  # tests the connection, not folders
+            elif not todo:
                 return False, "Select one or more folders first."
             self.stop_requested = False
             self.info = {
@@ -755,7 +878,7 @@ class Jobs:
             proc.terminate()
 
     def _run(self, kind, s, folders):
-        log("task", f"{JOB_NAMES[kind]} started for: {', '.join(folders)}")
+        log("task", f"{JOB_NAMES[kind]} started" + (f" for: {', '.join(folders)}" if folders else "."))
         try:
             if kind == "full":
                 ok, message = self._full(s, folders)
@@ -763,6 +886,8 @@ class Jobs:
                     self._count(s, active_folders(s))
             elif kind == "compare":
                 ok, message = self._compare(s, folders)
+            elif kind == "speed":
+                ok, message = self._speed(s)
             else:
                 ok, message = self._count(s, folders)
         except Exception as err:  # keep the web UI alive whatever happens
@@ -806,6 +931,8 @@ class Jobs:
             log("rsync", explain_ssh_error(text) or text)
 
     def _on_progress(self, line):
+        if rsync_file_line(line, lambda _: self.info and self.info["folder"]):
+            return
         match = PROGRESS_RE.match(line)
         if not match:
             log("rsync", line)
@@ -844,7 +971,7 @@ class Jobs:
                 log("task", f"{folder} is empty on the main server. Skipped so the backup copy is not wiped by accident.")
                 problems.append(f"{folder} (empty, skipped)")
                 continue
-            cmd = rsync_base(s) + ["--info=progress2", "--no-inc-recursive"]
+            cmd = rsync_base(s) + ["--info=progress2", "--no-inc-recursive", OUT_FORMAT.format("")]
             if s["delete"]:
                 cmd.append("--delete")
             cmd += [src + "/", f"{SSH_ALIAS}:{remote_dir(s, folder)}/"]
@@ -923,7 +1050,50 @@ class Jobs:
             return False, error
         return True, "Counted both servers."
 
+    def _speed(self, s):
+        def remote(command, options=()):
+            return ["ssh", *options, SSH_ALIAS, command]
 
+        def stop():
+            return self.stop_requested
+
+        ciphers = speedtest.local_ciphers()
+        steps = len(ciphers) + 2
+        result = {"time": time.time(), "busy": transfer.speed() > 1_000_000, "ciphers": []}
+        self.set(phase="Network without SSH", index=1, total=steps)
+        result["network"] = speedtest.network(remote, s["host"], stop=stop)
+        for index, cipher in enumerate(ciphers, 2):
+            if self.stop_requested:
+                return False, "Stopped."
+            self.set(phase=f"SSH with {cipher}", index=index, percent=int((index - 1) / steps * 100))
+            measured = speedtest.ssh_pipe(remote, cipher, stop=stop)
+            if measured.get("error"):
+                measured["error"] = explain_ssh_error(measured["error"]) or measured["error"]
+            result["ciphers"].append({"name": cipher, **measured})
+        if self.stop_requested:
+            return False, "Stopped."
+        working = [c for c in result["ciphers"] if c.get("bps")]
+        if not working:
+            update_state(speedtest=result)
+            return False, "SSH to the backup server failed: " + (result["ciphers"][0].get("error") or "no answer.")
+        self.set(phase="Writing a 1 GB test file on the backup server", index=steps,
+                 percent=int((steps - 1) / steps * 100))
+        result["disk"] = speedtest.remote_disk(remote, s["target"])
+        result["cpu"] = {"main": speedtest.cpu_info(), "backup": result["disk"].pop("cpu", None)}
+        best = max(working, key=lambda c: c["bps"])
+        result["cipher"] = best["name"]
+        result["bottleneck"] = speedtest.verdict(
+            result["network"].get("bps"), best["bps"], result["disk"].get("bps"))
+        update_state(speedtest=result)
+        write_ssh_config(s)  # syncs from now on use the fastest cipher
+        self.set(percent=100)
+        limit = min(b for b in (best["bps"], result["disk"].get("bps")) if b)
+        where = {"disk": "writing on the backup server", "encryption": "SSH encryption",
+                 "network": "the network"}[result["bottleneck"]]
+        return True, f"Done. At most {limit / 1e6:.0f} MB/s ({limit * 8 / 1e6:.0f} Mbit/s), limited by {where}."
+
+
+transfer = Transfer()
 lsyncd = Lsyncd()
 unison = Unison()
 jobs = Jobs()
@@ -1044,6 +1214,8 @@ def status_payload():
         "last_full": state.get("last_full"),
         "last_compare": compare,
         "counts": state.get("counts"),
+        "transfer": transfer.snapshot(),
+        "speedtest": state.get("speedtest"),
         "folders": [
             {"path": f, "exists": os.path.isdir(source_dir(f)), "target": remote_dir(s, f),
              "mode": "twoway" if f in s["twoway"] else "mirror"}
@@ -1144,7 +1316,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             message = apply_settings(settings)
             self._send(200, {"settings": settings, "message": message})
-        elif path in ("/api/jobs/full", "/api/jobs/compare", "/api/jobs/count"):
+        elif path in ("/api/jobs/full", "/api/jobs/compare", "/api/jobs/count", "/api/jobs/speed"):
             ok, why = jobs.start(path.rsplit("/", 1)[1])
             self._send(200 if ok else 409, {"ok": ok, "error": why})
         elif path == "/api/jobs/stop":
@@ -1206,6 +1378,7 @@ def main():
     threading.Thread(target=lsyncd.watchdog, daemon=True).start()
     threading.Thread(target=unison.watchdog, daemon=True).start()
     threading.Thread(target=scheduler, daemon=True).start()
+    threading.Thread(target=transfer.run, daemon=True).start()
     threading.Thread(target=startup, args=(settings,), daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     server.daemon_threads = True

@@ -29,6 +29,8 @@ Image: `ghcr.io/mikaas111/lsyncd-webui:latest`
 - **Pick folders in the browser.** Tick shares or subfolders in a folder tree. Shares that are shortcuts to a pool, such as `appdata`, work too.
 - **Excludes.** Skip files like `*.tmp` or whole folders like `cache/`.
 - **Progress.** See how far a full sync is, with speed and time left.
+- **Live transfer view.** The current speed and the last file that was copied in full, updated every 2 seconds.
+- **Speed test.** Finds what limits the sync speed (the network, SSH encryption or the backup's disks) and switches to the fastest encryption.
 - **Counts on both servers.** Folders, files and total size per folder, on the main server and on the backup, side by side.
 - **Compare.** A dry run that lists every file that differs, without changing anything.
 - **Nightly full sync.** Catches anything live sync could not see, such as files written straight to a disk.
@@ -158,10 +160,10 @@ Counting also runs after every full sync, including the nightly one, so the over
 
 | Tab | What it does |
 | --- | --- |
-| **Overview** | Live sync status, two-way sync status, the queue of changes waiting to be sent, progress of the running task, counts on both servers and the last comparison. |
+| **Overview** | Current transfer speed and the last file copied, live sync status, two-way sync status, the queue of changes waiting to be sent, progress of the running task, counts on both servers and the last comparison. |
 | **Folders** | Folder tree of the main server. Tick what to sync, choose Mirror or Two-way per folder, and see where each folder goes on the backup. |
 | **Excludes** | Patterns for files and folders to skip, one per line. |
-| **Settings** | Backup server address, delay, deletion mirroring, compression, bandwidth limit, nightly sync time and the SSH key. |
+| **Settings** | Backup server address, delay, deletion mirroring, compression, bandwidth limit, nightly sync time, the SSH key and the speed test. |
 | **Log** | Everything lsyncd, rsync and the app report. |
 
 ## Large shares: raise the watch limit
@@ -173,6 +175,26 @@ sysctl -w fs.inotify.max_user_watches=1048576
 ```
 
 That command lasts until the next reboot. To make it stick, run it at every boot: on Unraid 7 with the *User Scripts* plugin (schedule **At Startup of Array**) or the *Tips and Tweaks* plugin; on other Linux systems with a file in `/etc/sysctl.d/`.
+
+## Sync slower than expected? Run the speed test
+
+Open **Settings** and click **Run speed test**. It takes about half a minute and measures each link between the servers on its own:
+
+| Test | What it measures |
+| --- | --- |
+| **Network without SSH** | Internet and VPN between the servers, nothing else. The backup container opens a random port for a few seconds for this; it needs host networking, which the template uses. |
+| **SSH with each cipher** | The network plus encryption on both servers. The fastest cipher is used for every sync from then on. |
+| **Disk writes on the backup** | Writing a 1 GB test file to the backup folder, including flushing it to disk. The file is deleted right after. |
+
+The slowest of these is the most the sync can reach. What to do about it:
+
+- **Network.** The main server's *upload* and the backup's *download* both count, so check the internet connection at both locations, for example with a speed test site. Many connections sold as 1 Gbit upload much less. If both are clearly faster than the test, a lower MTU on the VPN tunnel (such as 1380, on both ends) sometimes helps.
+- **SSH encryption.** One of the servers runs out of CPU time. The speed test already switched to the fastest cipher. A CPU without AES-NI (shown under the results) is usually the cause.
+- **Disk writes on the backup.** Unraid writes to the array with parity, which is slow by default. Set **Settings → Disk Settings → Tunable (md_write_method)** to **reconstruct write** (turbo write): writes no longer read parity first and are often much faster, but all array disks spin while writing. A cache pool for the backup share helps too.
+
+Many small files always go slower than these numbers, because every file costs a few round trips between the servers. Run the test when nothing else is syncing; it warns you if something was.
+
+The **Transfer** card on **Overview** shows the speed of everything this container sends and receives, and the last file that reached the other server in full.
 
 ## Unraid 8 and other systems
 
@@ -207,7 +229,7 @@ Then click **Apply**. The container picks the new paths up by itself and your se
 - The backup container only accepts the main server's key, and it can only write to the backup folder you mounted.
 - The main container reads mirrored folders through a read-only mount. It only writes to folders you set to two-way.
 - The backup server's host key is trusted on the first connection and checked on every connection after that.
-- All data travels encrypted over SSH.
+- All data travels encrypted over SSH. Only the speed test's network check sends unencrypted zeros, straight to a port the backup container opens for a few seconds and that only accepts a one-time token.
 - The web interface has no login unless you set `WEBUI_PASSWORD`. Never expose port 8484 to the internet.
 
 ## Troubleshooting
@@ -221,6 +243,7 @@ Then click **Apply**. The container picks the new paths up by itself and your se
 | Counts differ but **Compare** finds nothing | A file changed while counting. Click **Count files** again. |
 | Something was not mirrored | Files written directly to `/mnt/cache` or `/mnt/diskX` bypass live sync. The nightly full sync picks them up, or click **Full sync now**. |
 | Watched folders close to the limit | See *Large shares* above. |
+| Syncing is slower than your internet connection | Run the speed test, see *Sync slower than expected?* above. |
 | Saving a two-way folder says the container cannot write to it | Add the `/mnt-rw` path, see *Updating*. |
 | A share shows no contents, or is marked *shortcut, target not reachable* | Add the `/mnt` path, see *Updating*. |
 | A file named like `report (conflict on …)` appears | That file changed on both servers. The newest version kept the normal name; this is the other version. Delete it once you have checked it. |

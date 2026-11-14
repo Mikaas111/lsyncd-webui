@@ -1,7 +1,10 @@
 import importlib
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 APP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app")
@@ -20,6 +23,12 @@ os.symlink("../nopool/gone/", os.path.join(os.environ["DATA_DIR"], "gone"))
 
 server = importlib.import_module("server")
 count = importlib.import_module("count")
+speedtest = importlib.import_module("speedtest")
+
+
+def run_here(command, options=()):
+    """Stands in for ssh: runs the remote command on this machine."""
+    return ["sh", "-c", command]
 
 
 class ProgressTest(unittest.TestCase):
@@ -63,7 +72,8 @@ class LsyncdConfigTest(unittest.TestCase):
         self.assertEqual(conf.count("sync {"), 2)
         self.assertIn('targetdir = "/backup/has \\"quote\\"/"', conf)
         self.assertIn('"odd\\"name"', conf)
-        self.assertIn('_extra = { "--bwlimit=500" }', conf)
+        self.assertIn('_extra = { "--out-format=@lsw@0 %i %l %b %n", "--bwlimit=500" }', conf)
+        self.assertIn('"--out-format=@lsw@1 %i %l %b %n"', conf)
         self.assertIn("delete = true", conf)
         self.assertIn("init = false", conf)
         self.assertIn(f'ssh = {{ binary = "{server.SSH_WRAPPER}" }}', conf)
@@ -148,6 +158,96 @@ class ShortcutTest(unittest.TestCase):
             self.assertEqual(server.first_dir("LSYNCD_WEBUI_TEST_DIR", [TMP.name]), "/chosen")
         finally:
             del os.environ["LSYNCD_WEBUI_TEST_DIR"]
+
+
+class TransferTest(unittest.TestCase):
+    def test_full_sync_reports_sent_files_without_logging_them(self):
+        jobs = server.Jobs()
+        jobs.info = {"folder": "Photos"}
+        before = list(server.LOG)
+        jobs._on_progress("@lsw@ <f+++++++++ 1234 1234 2024/img 1.jpg")
+        jobs._on_progress("@lsw@ cd+++++++++ 0 0 2024/")
+        jobs._on_progress("@lsw@ *deleting   0 0 old.jpg")
+        self.assertEqual(list(server.LOG), before)
+        last = server.transfer.last_file
+        self.assertEqual((last["path"], last["size"], last["direction"]), ("Photos/2024/img 1.jpg", 1234, "to backup"))
+
+    def test_lsyncd_lines_name_their_folder(self):
+        daemon = server.Lsyncd()
+        daemon.synced = ["Documents", "Photos"]
+        self.assertTrue(daemon.on_line("@lsw@1 <f.st...... 10 3 a.txt"))
+        self.assertEqual(server.transfer.last_file["path"], "Photos/a.txt")
+        self.assertFalse(daemon.on_line("Normal: Calling rsync with filter-list of new/modified files/dirs"))
+
+    def test_unison_reports_direction(self):
+        daemon = server.Unison()
+        daemon.on_line("[BGN] Copying Photos/x y.jpg from //backup-target//backup to /data-rw")
+        daemon.on_line("[END] Copying Photos/x y.jpg")
+        self.assertEqual(server.transfer.last_file["path"], "Photos/x y.jpg")
+        self.assertEqual(server.transfer.last_file["direction"], "to main")
+        daemon.on_line("[BGN] Updating file Photos/z from /data-rw to //backup-target//backup")
+        daemon.on_line("[END] Updating file Photos/z")
+        self.assertEqual(server.transfer.last_file["direction"], "to backup")
+
+    def test_speed_counts_what_ssh_writes(self):
+        fake = os.path.join(TMP.name, "bin", "ssh")
+        os.makedirs(os.path.dirname(fake), exist_ok=True)
+        if not os.path.exists(fake):
+            os.symlink(shutil.which("cat"), fake)
+        monitor = server.Transfer()
+        monitor.sample()
+        proc = subprocess.Popen([fake], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+        try:
+            monitor.sample()
+            proc.stdin.write(bytes(5 << 20))
+            proc.stdin.flush()
+            time.sleep(0.3)
+            monitor.sample()
+        finally:
+            proc.stdin.close()
+            proc.wait()
+        self.assertGreaterEqual(monitor.total, 5 << 20)
+        self.assertGreater(monitor.speed(), 0)
+
+
+class SpeedTestTest(unittest.TestCase):
+    def test_each_link_is_measured(self):
+        self.assertGreater(speedtest.network(run_here, "127.0.0.1", seconds=0.3)["bps"], 0)
+        self.assertGreater(speedtest.ssh_pipe(run_here, "aes128-gcm@openssh.com", seconds=0.3)["bps"], 0)
+        with tempfile.TemporaryDirectory() as target:
+            disk = speedtest.remote_disk(run_here, target, size_mb=8)
+            self.assertEqual(disk["bytes"], 8 << 20)
+            self.assertGreater(disk["bps"], 0)
+            self.assertEqual(os.listdir(target), [])
+        self.assertIn("error", speedtest.remote_disk(run_here, "/does/not/exist", size_mb=1))
+
+    def test_failures_are_reported(self):
+        failing = lambda command, options=(): ["sh", "-c", "echo 'no matching cipher found' >&2; exit 255"]
+        self.assertEqual(speedtest.ssh_pipe(failing, "x", seconds=0.3)["error"], "no matching cipher found")
+        self.assertIn("error", speedtest.network(failing, "127.0.0.1", seconds=0.3))
+
+    def test_verdict(self):
+        self.assertEqual(speedtest.verdict(110e6, 100e6, 30e6), "disk")
+        self.assertEqual(speedtest.verdict(110e6, 40e6, 200e6), "encryption")
+        self.assertEqual(speedtest.verdict(25e6, 24e6, 200e6), "network")
+        self.assertEqual(speedtest.verdict(None, 24e6, None), "network")
+
+    def test_fastest_cipher_goes_into_the_ssh_config(self):
+        os.makedirs(server.SSH_DIR, exist_ok=True)
+        s, _ = server.validate({"host": "10.0.0.2"})
+        try:
+            server.update_state(speedtest={"cipher": "aes128-gcm@openssh.com"})
+            server.write_ssh_config(s)
+            with open(server.SSH_CONFIG) as f:
+                self.assertIn("    Ciphers ^aes128-gcm@openssh.com\n", f.read())
+            server.update_state(speedtest={"cipher": "x\n    ProxyCommand evil"})
+            server.write_ssh_config(s)
+            with open(server.SSH_CONFIG) as f:
+                text = f.read()
+            self.assertNotIn("Ciphers", text)
+            self.assertNotIn("ProxyCommand", text)
+        finally:
+            server.update_state(speedtest=None)
 
 
 class CountTest(unittest.TestCase):
