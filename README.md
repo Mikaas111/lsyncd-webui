@@ -54,7 +54,7 @@ Every selected folder has a mode:
 
 - **Live** (default): the main server decides. lsyncd sends its changes to the backup within seconds, and anything changed on the backup is overwritten.
 - **Scheduled**: also a mirror of the main server, but copied every few hours (**Settings → Scheduled folders: hours between syncs**, 6 by default) instead of live. Use it for folders that change all the time, such as appdata with its databases and logs: live sync would keep sending them in between everything else. lsyncd does not watch these folders, which also saves watches (see *Large shares*). A restart of the container does not go through them again; the schedule and the nightly full sync do.
-- **Two-way**: changes on either server are copied to the other, including deletions. This runs through [Unison](https://github.com/bcpierce00/unison), which watches both servers and keeps a record of the last sync, so it can tell a new file on one side from a deleted file on the other. When the same file changed on both servers, the newest version wins and the other one is kept next to it as a conflict copy, so nothing is lost. If one whole side looks deleted, for example because a mount is missing, Unison stops instead of copying that deletion.
+- **Two-way**: changes on either server are copied to the other, including deletions. This runs through [Unison](https://github.com/bcpierce00/unison), which watches both servers and keeps a record of the last sync, so it can tell a new file on one side from a deleted file on the other. When the same file changed on both servers, the newest version wins and the other one is kept next to it as a conflict copy, so nothing is lost. If one whole side looks deleted, for example because a mount is missing, Unison stops instead of copying that deletion. Unison copies one file at a time, looks over the whole folder once a day for anything its watcher missed, and pauses while a task such as a full sync runs. Its first sync of a big folder takes a while: it has to read both sides once.
 
 Two-way folders need write access on the main server, through the extra path `/mnt-rw`. Live and scheduled folders are never written.
 
@@ -157,7 +157,7 @@ On **Overview**:
 - **Count files** counts folders, files and size on both servers. Every row should say **Identical**.
 - **Compare** lists every file that differs. **Identical: no differences found** means the backup is an exact copy.
 
-Counting also runs after every full sync, including the nightly one, so the overview stays current.
+Counting and comparing go through every file on both servers, so they only run when you click them. Do it after the first full sync, and now and then after that.
 
 ## The web interface
 
@@ -209,6 +209,16 @@ A VPN such as WireGuard already encrypts everything between the servers, so SSH 
 - The data itself is not encrypted by the containers. Only choose this when the backup address is a VPN address, never across the internet without a VPN.
 - When you save, the main server first checks that it can log in this way. If the backup container is too old or the port is blocked, the setting is not saved and you see why.
 - Switch back to **SSH (encrypted)** at any time.
+
+## Light on the backup server
+
+The backup server only has to write what changed. To keep the rest of its work low:
+
+- **One transfer at a time.** Live sync sends one batch at a time across all folders, Unison copies one file at a time, and Unison pauses while a full sync, compare, count or speed test runs. Several transfers at once make the disks of a parity array jump back and forth, which is much slower than one after the other.
+- **Whole files** (**Settings → Send changed files whole**, on by default). The backup does not have to read the old version of a changed file to work out the difference; the main server simply sends the file again. Turn it off on a slow connection where bandwidth matters more.
+- **Counting and comparing only on request**, since both go through every file on the backup.
+- **Scheduled folders** for folders that change all the time, so they are not sent over and over.
+- On Unraid, writes to the array are often what limits the speed. **Settings → Disk Settings → Tunable (md_write_method) → reconstruct write** (turbo write) on the backup server makes them a lot faster, especially for the first full copy.
 
 ## Unraid 8 and other systems
 

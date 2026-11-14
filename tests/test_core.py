@@ -73,12 +73,45 @@ class LsyncdConfigTest(unittest.TestCase):
         self.assertEqual(conf.count("sync {"), 2)
         self.assertIn('targetdir = "/backup/has \\"quote\\"/"', conf)
         self.assertIn('"odd\\"name"', conf)
-        self.assertIn('_extra = { "--out-format=@lsw@0 %i %l %b %n", "--bwlimit=500" }', conf)
+        self.assertIn('_extra = { "--out-format=@lsw@0 %i %l %b %n", "--whole-file", "--bwlimit=500" }', conf)
+        self.assertIn("maxProcesses = 1,", conf)  # one transfer at a time to the backup
         self.assertIn('"--out-format=@lsw@1 %i %l %b %n"', conf)
         self.assertIn("delete = true", conf)
         self.assertIn("init = false", conf)
         self.assertIn(f'ssh = {{ binary = "{server.SSH_WRAPPER}" }}', conf)
         self.assertEqual(conf.count("{"), conf.count("}"))
+
+
+class BackupLoadTest(unittest.TestCase):
+    def test_whole_files_can_be_switched_off(self):
+        on, _ = server.validate({"host": "10.0.0.2", "folders": ["Photos"], "twoway": ["Photos"]})
+        off, _ = server.validate({"host": "10.0.0.2", "folders": ["Photos"], "twoway": ["Photos"], "whole_file": False})
+        self.assertIn("--whole-file", server.rsync_base(on))
+        self.assertNotIn("--whole-file", server.rsync_base(off))
+        self.assertNotIn("--whole-file", server.build_lsyncd_conf(off, ["Photos"]))
+        self.assertNotIn("-rsync", server.build_unison_cmd(off, ["Photos"]))
+
+    def test_unison_pauses_and_continues(self):
+        def state(pid):
+            with open(f"/proc/{pid}/stat") as f:
+                return f.read().rsplit(")", 1)[1].split()[0]
+
+        daemon = server.Unison()
+        daemon.proc = subprocess.Popen(["sleep", "30"])
+        try:
+            daemon.pause()
+            time.sleep(0.2)
+            self.assertEqual((daemon.paused, state(daemon.proc.pid)), (True, "T"))
+            daemon.resume()
+            time.sleep(0.2)
+            self.assertEqual((daemon.paused, state(daemon.proc.pid)), (False, "S"))
+            daemon.pause()
+            proc = daemon.proc
+            daemon.stop()  # stopping also works on a paused process
+            self.assertIsNotNone(proc.poll())
+        finally:
+            if daemon.proc is not None:
+                daemon.proc.kill()
 
 
 class ScheduledTest(unittest.TestCase):
@@ -189,7 +222,9 @@ class TwoWayTest(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("-path") + 1], "Photos")
         for flag in ("-batch", "-copyonconflict", "-times", "-numericids"):
             self.assertIn(flag, cmd)
-        self.assertEqual(cmd[cmd.index("-repeat") + 1], "watch")
+        self.assertEqual(cmd[cmd.index("-repeat") + 1], "watch+86400")
+        self.assertEqual(cmd[cmd.index("-maxthreads") + 1], "1")
+        self.assertEqual(cmd[cmd.index("-rsync") + 1], "false")
         self.assertEqual(cmd[cmd.index("-prefer") + 1], "newer")
         self.assertEqual(cmd[cmd.index("-sshcmd") + 1], server.SSH_WRAPPER)
         ignores = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "-ignore"]

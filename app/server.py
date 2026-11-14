@@ -83,6 +83,7 @@ DEFAULTS = {
     "delay": 5,
     "delete": True,
     "compress": False,
+    "whole_file": True,
     "bwlimit": 0,
     "nightly": "03:00",
     "encryption": "ssh",
@@ -219,6 +220,7 @@ def validate(raw, check_folders=True):
 
     s["delete"] = bool(raw.get("delete", True))
     s["compress"] = bool(raw.get("compress", False))
+    s["whole_file"] = bool(raw.get("whole_file", True))
 
     nightly = str(raw.get("nightly", s["nightly"]) or "").strip()
     if nightly and not TIME_RE.match(nightly):
@@ -434,6 +436,8 @@ def ensure_remote_dirs(s, folders):
 
 def rsync_base(s):
     cmd = ["rsync", "-a"]
+    if s["whole_file"]:
+        cmd.append("--whole-file")  # the backup does not read the old version to work out a difference
     if s["compress"]:
         cmd.append("--compress")
     if s["bwlimit"]:
@@ -500,11 +504,14 @@ def build_lsyncd_conf(s, folders):
         "settings {",
         f"    statusFile = {lua(STATUS_FILE)},",
         "    statusInterval = 5,",
+        # One transfer at a time across all folders: parallel writes make a parity array crawl
+        "    maxProcesses = 1,",
         "}",
         "",
     ]
     for index, folder in enumerate(folders):
-        extra = [OUT_FORMAT.format(index)] + ([f"--bwlimit={s['bwlimit']}"] if s["bwlimit"] else [])
+        extra = [OUT_FORMAT.format(index)] + (["--whole-file"] if s["whole_file"] else [])
+        extra += [f"--bwlimit={s['bwlimit']}"] if s["bwlimit"] else []
         out += [
             "sync {",
             "    default.rsyncssh,",
@@ -581,13 +588,18 @@ def build_unison_cmd(s, folders):
             cmd += ["-follow", f"Path {folder}"]
     cmd += [
         "-batch", "-ui", "text",
-        "-repeat", "watch",
+        # React to changes at once, and look over everything once a day for what the watcher missed
+        "-repeat", "watch+86400",
+        # One file at a time (the default is 20 or more), so the backup's disks write in one go
+        "-maxthreads", "1",
         "-prefer", "newer", "-copyonconflict",
         "-times", "-owner", "-group", "-numericids",
         "-log=false",
         "-sshcmd", SSH_WRAPPER,
         "-servercmd", "unison",
     ]
+    if s["whole_file"]:
+        cmd += ["-rsync", "false"]
     for pattern in unison_ignores(s["excludes"], folders):
         cmd += ["-ignore", pattern]
     return cmd
@@ -752,6 +764,7 @@ class Daemon:
         self.last_error = ""
         self.last_activity = None
         self.retry_at = None
+        self.paused = False
 
     def running(self):
         proc = self.proc
@@ -817,7 +830,9 @@ class Daemon:
 
     def _stop(self):
         proc, self.proc = self.proc, None
+        self.paused = False
         if proc is not None and proc.poll() is None:
+            proc.send_signal(signal.SIGCONT)  # a paused process would not act on SIGTERM
             proc.terminate()
             try:
                 proc.wait(10)
@@ -900,6 +915,28 @@ class Unison(Daemon):
 
     def folders(self, s):
         return twoway_folders(s)
+
+    def start(self, s):
+        super().start(s)
+        if jobs.busy():  # (re)started during a task, such as after saving settings
+            self.pause()
+
+    def pause(self):
+        """Hold Unison while a task runs, so the backup server does one heavy thing at a time."""
+        with self.lock:
+            proc = self.proc
+            if proc is not None and proc.poll() is None and not self.paused:
+                proc.send_signal(signal.SIGSTOP)
+                self.paused = True
+                log(self.name, "Paused while a task runs; it continues where it was afterwards.")
+
+    def resume(self):
+        with self.lock:
+            proc = self.proc
+            if self.paused and proc is not None and proc.poll() is None:
+                proc.send_signal(signal.SIGCONT)
+                log(self.name, "Continuing.")
+            self.paused = False
 
     def prepare(self, s, folders):
         os.makedirs(UNISON_DIR, exist_ok=True)
@@ -1002,11 +1039,10 @@ class Jobs:
 
     def _run(self, kind, s, folders):
         log("task", f"{JOB_NAMES[kind]} started" + (f" for: {', '.join(folders)}" if folders else "."))
+        unison.pause()
         try:
             if kind in ("full", "scheduled"):
                 ok, message = self._full(s, folders, kind)
-                if kind == "full" and ok and not self.stop_requested:
-                    self._count(s, active_folders(s))
             elif kind == "compare":
                 ok, message = self._compare(s, folders)
             elif kind == "speed":
@@ -1015,6 +1051,8 @@ class Jobs:
                 ok, message = self._count(s, folders)
         except Exception as err:  # keep the web UI alive whatever happens
             ok, message = False, f"Unexpected error: {err}"
+        finally:
+            unison.resume()
         state = "stopped" if self.stop_requested else ("done" if ok else "failed")
         if self.stop_requested:
             message = "Stopped."
@@ -1093,9 +1131,8 @@ class Jobs:
         twoway = [f for f in folders if f in s["twoway"]]
         if twoway:
             # Never rsync --delete a two-way folder: it would remove files that are new on the backup.
-            # Restarting Unison makes it compare both sides in full instead.
-            log("task", f"Two-way folders are reconciled by Unison: {', '.join(twoway)}")
-            unison.start(s)
+            # Unison keeps them in sync, and looks over everything once a day itself.
+            log("task", f"Two-way folders are left to Unison: {', '.join(twoway)}")
         folders = [f for f in folders if f not in s["twoway"]]
         ensure_remote_dirs(s, folders)
         problems = []
@@ -1133,7 +1170,7 @@ class Jobs:
         else:
             ok, message = True, f"Done: {len(folders)} mirrored folder(s) in sync."
             if twoway:
-                message += f" Unison is comparing {len(twoway)} two-way folder(s)."
+                message += f" {len(twoway)} two-way folder(s) are kept in sync by Unison."
         result = {"time": time.time(), "ok": ok, "message": message}
         if kind == "scheduled":
             update_state(last_scheduled=result)
@@ -1382,6 +1419,7 @@ def status_payload():
         "unison": {
             "folders": s["twoway"],
             "running": unison.running(),
+            "paused": unison.paused,
             "wanted": unison.wanted,
             "since": unison.started_at,
             "last_activity": unison.last_activity,

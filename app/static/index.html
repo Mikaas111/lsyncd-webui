@@ -202,7 +202,7 @@ details summary { cursor: pointer; color: var(--accent); font-size: 14px; }
 
     <div class="card">
       <h2>Main server vs backup</h2>
-      <p class="lead">Folders and files on both servers, counted with the same excludes. Counted after every full sync, or when you click <b>Count files</b>.</p>
+      <p class="lead">Folders and files on both servers, counted with the same excludes, when you click <b>Count files</b>. Counting goes through every file on both servers, so it does not run on its own.</p>
       <div class="table-wrap" id="counts">–</div>
       <div id="counts-foot" class="small muted" style="margin-top:10px"></div>
     </div>
@@ -288,6 +288,7 @@ details summary { cursor: pointer; color: var(--accent); font-size: 14px; }
           <label class="field"><span>Scheduled folders: hours between syncs</span><input type="number" name="schedule_hours" min="1" max="168"><small>Folders set to Scheduled are copied this often instead of live. The nightly full sync copies them too.</small></label>
           <label class="check"><input type="checkbox" name="delete"><span>Mirror deletions<small>Files deleted on the main server are deleted on the backup too, so the backup is an exact copy.</small></span></label>
           <label class="check"><input type="checkbox" name="compress"><span>Compress during transfer<small>Saves bandwidth, costs CPU on both servers.</small></span></label>
+          <label class="check"><input type="checkbox" name="whole_file"><span>Send changed files whole<small>Less work for a slow backup server: it does not read the old version of a file to work out what changed. A big file that changes a little uses more bandwidth.</small></span></label>
           <label class="field"><span>Bandwidth limit (KB/s)</span><input type="number" name="bwlimit" min="0"><small>0 means no limit.</small></label>
           <label class="field"><span>Nightly full sync</span><input type="time" name="nightly"><small>Compares everything once a day and fixes what live sync missed. Leave empty to turn off.</small></label>
         </div>
@@ -423,8 +424,9 @@ function renderOverview(st) {
   const u = st.unison;
   $("#twoway-card").hidden = !u.folders.length;
   if (u.folders.length) {
-    $("#u-state").textContent = u.running ? "Running" : "Stopped";
-    $("#u-state-s").textContent = u.running ? "since " + stamp(u.since) : (u.last_error || "");
+    $("#u-state").textContent = u.running ? (u.paused ? "Paused" : "Running") : "Stopped";
+    $("#u-state-s").textContent = u.paused ? "while a task runs, so the backup server does one thing at a time"
+      : u.running ? "since " + stamp(u.since) : (u.last_error || "");
     $("#u-folders").textContent = num(u.folders.length);
     $("#u-folders-s").textContent = u.folders.join(", ");
     $("#u-last").textContent = ago(u.last_activity);
