@@ -190,7 +190,7 @@ details summary { cursor: pointer; color: var(--accent); font-size: 14px; }
         <div class="row"><span class="unsaved" id="folders-dirty" hidden>Unsaved changes</span><button class="btn primary" id="save-folders">Save</button></div>
       </div>
       <p class="lead">Tick the folders that must be on the backup. A ticked folder includes everything inside it. Per folder, choose <b>Mirror</b> (the main server decides, the backup follows) or <b>Two-way</b> (changes on either server are copied to the other). Removing a folder here stops syncing it; its copy on the backup stays.</p>
-      <p class="small" id="rw-warning" hidden style="color:var(--warn)">Two-way needs write access on the main server. Add the path <code>/data-rw</code> (your shares, read-write) to this container's settings first.</p>
+      <p class="small" id="rw-warning" hidden style="color:var(--warn)">Two-way needs write access on the main server. Map the host's <code>/mnt</code> to <code>/mnt-rw</code> (read-write) in this container's settings first.</p>
       <div class="grid2">
         <div>
           <div class="small muted" style="margin-bottom:6px">On the main server</div>
@@ -559,6 +559,14 @@ function treeNode(d) {
   box.dataset.path = d.path;
   label.append(box, document.createTextNode(d.name));
   row.append(toggle, label);
+  if (d.link) {
+    const tag = document.createElement("span");
+    tag.className = "badge " + (d.broken ? "tone-bad" : "tone-muted");
+    tag.textContent = d.broken ? "shortcut, target not reachable" : "shortcut";
+    tag.title = "Points to " + d.link + (d.broken ? ". Map the host's /mnt to /mnt in the container settings." : "");
+    row.append(tag);
+  }
+  if (d.broken) { box.disabled = true; box.dataset.broken = "1"; }
   li.append(row);
   const ul = document.createElement("ul");
   ul.hidden = true;
@@ -584,7 +592,7 @@ function syncTree() {
   $$("#tree input[data-path]").forEach(box => {
     const p = box.dataset.path, under = covered(p);
     box.checked = app.selected.has(p) || under;
-    box.disabled = under;
+    box.disabled = under || box.dataset.broken === "1";
   });
 }
 

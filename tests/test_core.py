@@ -13,6 +13,10 @@ os.environ["DATA_RW_DIR"] = os.environ["DATA_DIR"]
 os.environ["CONFIG_DIR"] = os.path.join(TMP.name, "config")
 for folder in ("Documents", "Documents/2024", "Photos", "has \"quote\""):
     os.makedirs(os.path.join(os.environ["DATA_DIR"], folder))
+# Unraid-style exclusive share: a relative shortcut from the user share to a pool
+os.makedirs(os.path.join(TMP.name, "cache", "appdata", "plex"))
+os.symlink("../cache/appdata/", os.path.join(os.environ["DATA_DIR"], "appdata"))
+os.symlink("../nopool/gone/", os.path.join(os.environ["DATA_DIR"], "gone"))
 
 server = importlib.import_module("server")
 count = importlib.import_module("count")
@@ -79,7 +83,7 @@ class TwoWayTest(unittest.TestCase):
         finally:
             server.DATA_RW_DIR = old
         self.assertEqual(len(errors), 1)
-        self.assertIn("/data-rw", errors[0].replace("/does/not/exist", "/data-rw"))
+        self.assertIn("/mnt-rw", errors[0])
 
     def test_twoway_folders_are_left_out_of_lsyncd(self):
         s, _ = server.validate({"host": "10.0.0.2", "folders": ["Documents", "Photos"], "twoway": ["Photos"]})
@@ -104,6 +108,46 @@ class TwoWayTest(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("-sshcmd") + 1], server.SSH_WRAPPER)
         ignores = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "-ignore"]
         self.assertEqual(ignores, ["Name *.tmp", "Name cache", "Path Photos/Downloads", "Path Photos/a/b"])
+        self.assertNotIn("-follow", cmd)
+
+
+class ShortcutTest(unittest.TestCase):
+    def test_browse_follows_relative_shortcuts(self):
+        entries = {d["name"]: d for d in server.browse("")["dirs"]}
+        self.assertEqual(entries["appdata"]["link"], "../cache/appdata/")
+        self.assertFalse(entries["appdata"]["broken"])
+        self.assertTrue(entries["appdata"]["children"])
+        self.assertTrue(entries["gone"]["broken"])
+        self.assertNotIn("link", entries["Photos"])
+        self.assertEqual([d["name"] for d in server.browse("appdata")["dirs"]], ["plex"])
+
+    def test_shortcut_can_be_selected_and_counted(self):
+        s, errors = server.validate({"folders": ["appdata"]})
+        self.assertEqual((s["folders"], errors), (["appdata"], []))
+        with open(os.path.join(TMP.name, "cache", "appdata", "plex", "library.db"), "w") as f:
+            f.write("x")
+        counted = count.count_tree(server.source_dir("appdata"))
+        self.assertEqual((counted["dirs"], counted["files"]), (1, 1))
+
+    def test_broken_shortcut_explains_the_fix(self):
+        _, errors = server.validate({"folders": ["gone"]})
+        self.assertIn("shortcut to ../nopool/gone/", errors[0])
+        self.assertIn("/mnt", errors[0])
+
+    def test_unison_follows_a_shortcut(self):
+        s, _ = server.validate({"host": "10.0.0.2", "folders": ["appdata"], "twoway": ["appdata"]})
+        cmd = server.build_unison_cmd(s, ["appdata"])
+        self.assertEqual(cmd[cmd.index("-follow") + 1], "Path appdata")
+
+    def test_first_dir_prefers_an_existing_candidate(self):
+        os.environ.pop("LSYNCD_WEBUI_TEST_DIR", None)
+        self.assertEqual(server.first_dir("LSYNCD_WEBUI_TEST_DIR", ["/does/not/exist", TMP.name]), TMP.name)
+        self.assertEqual(server.first_dir("LSYNCD_WEBUI_TEST_DIR", ["/nope1", "/nope2"]), "/nope2")
+        os.environ["LSYNCD_WEBUI_TEST_DIR"] = "/chosen"
+        try:
+            self.assertEqual(server.first_dir("LSYNCD_WEBUI_TEST_DIR", [TMP.name]), "/chosen")
+        finally:
+            del os.environ["LSYNCD_WEBUI_TEST_DIR"]
 
 
 class CountTest(unittest.TestCase):

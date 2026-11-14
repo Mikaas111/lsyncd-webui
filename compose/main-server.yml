@@ -11,7 +11,8 @@ services:
       WEBUI_PASSWORD: ""
       TZ: Europe/Amsterdam
     volumes:
-      - /mnt/user:/data:ro
+      # All of /mnt, so shares that are shortcuts to a pool (such as appdata) work too
+      - /mnt:/mnt:ro
       # Only written for folders set to two-way; leave out if you only mirror
-      - /mnt/user:/data-rw
+      - /mnt:/mnt-rw
       - /mnt/user/appdata/lsyncd-webui:/config

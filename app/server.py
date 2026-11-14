@@ -27,11 +27,22 @@ from urllib.parse import parse_qs, urlparse
 
 import count
 
+def first_dir(env_name, candidates):
+    """The environment variable if set, else the first candidate that exists."""
+    value = os.environ.get(env_name)
+    if value:
+        return value
+    return next((c for c in candidates if os.path.isdir(c)), candidates[-1])
+
+
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(APP_DIR, "static")
-DATA_DIR = os.environ.get("DATA_DIR", "/data")
+# With the host's /mnt mounted at /mnt, Unraid's relative share shortcuts
+# (/mnt/user/appdata -> ../cache/appdata) resolve just like on the host.
+# /data is the older layout that only had /mnt/user.
+DATA_DIR = first_dir("DATA_DIR", ["/mnt/user", "/data"])
 # Same shares, mounted read-write; only two-way folders are ever written through it
-DATA_RW_DIR = os.environ.get("DATA_RW_DIR", "/data-rw")
+DATA_RW_DIR = first_dir("DATA_RW_DIR", ["/mnt-rw/user", "/data-rw"])
 CONFIG_DIR = os.environ.get("CONFIG_DIR", "/config")
 PORT = int(os.environ.get("WEBUI_PORT", "8484"))
 PASSWORD = os.environ.get("WEBUI_PASSWORD", "")
@@ -206,7 +217,7 @@ def validate(raw, check_folders=True):
         if folder is None:
             continue
         if check_folders and not os.path.isdir(source_dir(folder)):
-            errors.append(f"The folder {folder} does not exist.")
+            errors.append(broken_message(folder))
             continue
         folders.add(folder)
     # A folder inside another selected folder is already covered by its parent
@@ -219,7 +230,7 @@ def validate(raw, check_folders=True):
             if not os.path.isdir(rw_dir(folder)) or not os.access(rw_dir(folder), os.W_OK):
                 errors.append(
                     f"{folder} is set to two-way, but the container cannot write to it. "
-                    f"Add the path {DATA_RW_DIR} (your shares, read-write) to the container settings."
+                    "Map the host's /mnt to /mnt-rw (read-write) in the container settings."
                 )
     return s, errors
 
@@ -239,6 +250,23 @@ def remote_dir(s, folder):
 
 def rw_dir(folder):
     return os.path.join(DATA_RW_DIR, folder)
+
+
+def link_target(path):
+    try:
+        return os.readlink(path)
+    except OSError:
+        return None
+
+
+def broken_message(folder):
+    target = link_target(source_dir(folder))
+    if target is None:
+        return f"The folder {folder} does not exist."
+    return (
+        f"{folder} is a shortcut to {target}, which the container cannot reach. "
+        "Map the host's /mnt to /mnt (read only) in the container settings."
+    )
 
 
 def active_folders(s):
@@ -487,6 +515,9 @@ def build_unison_cmd(s, folders):
     cmd = ["unison", DATA_RW_DIR, f"ssh://{SSH_ALIAS}/{s['target']}"]
     for folder in folders:
         cmd += ["-path", folder]
+        if os.path.islink(rw_dir(folder)):
+            # Sync what the shortcut points to, not the shortcut itself
+            cmd += ["-follow", f"Path {folder}"]
     cmd += [
         "-batch", "-ui", "text",
         "-repeat", "watch",
@@ -942,12 +973,19 @@ def browse(rel):
                 if entry.name.startswith("."):
                     continue
                 try:
-                    if not entry.is_dir():
-                        continue
+                    is_dir = entry.is_dir()
+                    is_link = entry.is_symlink()
                 except OSError:
                     continue
+                broken = is_link and not os.path.exists(entry.path)
+                if not is_dir and not broken:
+                    continue
                 path = f"{rel}/{entry.name}" if rel else entry.name
-                dirs.append({"name": entry.name, "path": path, "children": has_subdirs(entry.path)})
+                item = {"name": entry.name, "path": path, "children": is_dir and has_subdirs(entry.path)}
+                if is_link:
+                    item["link"] = link_target(entry.path)
+                    item["broken"] = broken
+                dirs.append(item)
     except OSError as err:
         return {"path": rel, "dirs": [], "error": err.strerror or str(err)}
     dirs.sort(key=lambda d: d["name"].lower())

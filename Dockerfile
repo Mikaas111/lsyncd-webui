@@ -14,8 +14,6 @@ RUN chmod +x /app/entrypoint.sh /app/bin/ssh
 ENV ROLE=main \
     WEBUI_PORT=8484 \
     SSH_PORT=2222 \
-    DATA_DIR=/data \
-    DATA_RW_DIR=/data-rw \
     CONFIG_DIR=/config \
     LANG=C.UTF-8
 

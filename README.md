@@ -15,7 +15,7 @@ Built for Unraid, but it runs on any machine with Docker.
 ┌──────────────────────────┐   SSH over    ┌──────────────────────────┐
 │ lsyncd-webui             │   your VPN    │ lsyncd-webui-backup      │
 │  web UI + lsyncd         │ ────────────▶ │  SSH server + rsync      │
-│  /mnt/user → /data (ro)  │   port 2222   │  /mnt/user/backup        │
+│  /mnt (read only)        │   port 2222   │  /mnt/user/backup        │
 └──────────────────────────┘               └──────────────────────────┘
 ```
 
@@ -26,7 +26,7 @@ Image: `ghcr.io/mikaas111/lsyncd-webui:latest`
 - **Live sync.** lsyncd hears about every change from the kernel and sends only that file. The backup server never scans anything, so a slow backup machine keeps up.
 - **Exact copy.** Deletions and renames are mirrored too. You can switch that off.
 - **Two-way folders.** For folders you choose, changes made on the backup server are copied back to the main server too.
-- **Pick folders in the browser.** Tick shares or subfolders in a folder tree.
+- **Pick folders in the browser.** Tick shares or subfolders in a folder tree. Shares that are shortcuts to a pool, such as `appdata`, work too.
 - **Excludes.** Skip files like `*.tmp` or whole folders like `cache/`.
 - **Progress.** See how far a full sync is, with speed and time left.
 - **Counts on both servers.** Folders, files and total size per folder, on the main server and on the backup, side by side.
@@ -51,7 +51,13 @@ Every selected folder has a mode:
 - **Mirror** (default): the main server decides. lsyncd sends its changes to the backup, and anything changed on the backup is overwritten.
 - **Two-way**: changes on either server are copied to the other, including deletions. This runs through [Unison](https://github.com/bcpierce00/unison), which watches both servers and keeps a record of the last sync, so it can tell a new file on one side from a deleted file on the other. When the same file changed on both servers, the newest version wins and the other one is kept next to it as a conflict copy, so nothing is lost. If one whole side looks deleted, for example because a mount is missing, Unison stops instead of copying that deletion.
 
-Two-way folders need write access on the main server, through the extra path `/data-rw`. Mirrored folders are never written.
+Two-way folders need write access on the main server, through the extra path `/mnt-rw`. Mirrored folders are never written.
+
+### Shortcuts (exclusive shares)
+
+When a share lives entirely on one pool, Unraid turns `/mnt/user/<share>` into a shortcut (symlink) to the pool, for example `appdata -> ../cache/appdata`. The main container therefore maps all of `/mnt`, not just `/mnt/user`, so these shortcuts lead to the same place as on the host. A selected share that is a shortcut is synced by what it points to: its contents end up on the backup, not the shortcut itself. Shortcuts deeper inside a folder are copied as shortcuts, like any backup tool does.
+
+If the **Folders** tab marks a share as *shortcut, target not reachable*, the container cannot see the pool it points to. Map the host's `/mnt` to `/mnt` (see *Updating*).
 
 Both containers carry everything they need (Alpine Linux, lsyncd, rsync, Unison, OpenSSH, Python). The host only provides Docker, the folders and the network, so it does not matter which Linux your server runs.
 
@@ -110,8 +116,8 @@ Then go to **Docker → Add Container**, pick **lsyncd-webui** under **Template*
 
 | Field | Value |
 | --- | --- |
-| Shares (read only) | `/mnt/user`. Used for mirrored folders, which are never changed. |
-| Shares (read-write, two-way folders) | `/mnt/user`. Only written for folders you set to two-way. Leave it empty if you only mirror. |
+| Storage (read only) | `/mnt`. Your shares are read through `/mnt/user`; mapping all of `/mnt` makes pool shortcuts such as `appdata` work. Never changed. |
+| Storage (read-write, two-way folders) | `/mnt`. Only written for folders you set to two-way. Leave it empty if you only mirror. |
 | Config | `/mnt/user/appdata/lsyncd-webui` |
 | Web UI port | `8484` |
 | Web UI password | Optional, but recommended |
@@ -180,7 +186,14 @@ Unraid 8 moves from Slackware to a Fedora base. lsyncd-webui does not depend on 
 
 On Unraid: **Docker → Check for Updates → Apply Update**. With Compose: `docker compose pull && docker compose up -d`. Settings, keys and status live in `/config`, so they survive updates.
 
-**Installed before two-way folders existed?** To use two-way, edit the **lsyncd-webui** container on the main server, click **Add another Path, Port, Variable, Label or Device**, and add a **Path** with container path `/data-rw`, host path `/mnt/user` and access mode **Read/Write**. Then click **Apply**.
+**Installed an earlier version?** Older versions mapped only `/mnt/user` (to `/data` and `/data-rw`), which hides shares that are shortcuts to a pool. Edit the **lsyncd-webui** container on the main server and, with **Add another Path, Port, Variable, Label or Device**, add:
+
+| Container path | Host path | Access mode | Needed for |
+| --- | --- | --- | --- |
+| `/mnt` | `/mnt` | Read Only | All folders, including shortcuts such as `appdata` |
+| `/mnt-rw` | `/mnt` | Read/Write | Two-way folders only |
+
+Then click **Apply**. The container picks the new paths up by itself and your selected folders stay as they are. You can remove the old `/data` and `/data-rw` paths afterwards.
 
 ## Security notes
 
@@ -201,7 +214,8 @@ On Unraid: **Docker → Check for Updates → Apply Update**. With Compose: `doc
 | Counts differ but **Compare** finds nothing | A file changed while counting. Click **Count files** again. |
 | Something was not mirrored | Files written directly to `/mnt/cache` or `/mnt/diskX` bypass live sync. The nightly full sync picks them up, or click **Full sync now**. |
 | Watched folders close to the limit | See *Large shares* above. |
-| Saving a two-way folder says the container cannot write to it | Add the `/data-rw` path, see *Updating*. |
+| Saving a two-way folder says the container cannot write to it | Add the `/mnt-rw` path, see *Updating*. |
+| A share shows no contents, or is marked *shortcut, target not reachable* | Add the `/mnt` path, see *Updating*. |
 | A file named like `report (conflict on …)` appears | That file changed on both servers. The newest version kept the normal name; this is the other version. Delete it once you have checked it. |
 | **Two-way sync is not running** | Open **Log** and look at the lines marked `[unison]`. |
 
@@ -215,6 +229,8 @@ On Unraid: **Docker → Check for Updates → Apply Update**. With Compose: `doc
 | `SSH_PORT` | backup | `2222` | Port the backup container listens on |
 | `AUTHORIZED_KEY` | backup | empty | Public key of the main server |
 | `TZ` | both | `UTC` | Time zone, used for the nightly sync time |
+| `DATA_DIR` | main | `/mnt/user`, else `/data` | Where the shares are read. Only set it for an unusual layout. |
+| `DATA_RW_DIR` | main | `/mnt-rw/user`, else `/data-rw` | Where two-way folders are written. Only set it for an unusual layout. |
 
 ## Build your own image
 
