@@ -4,28 +4,31 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>lsyncd-webui</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232563eb'/%3E%3Cpath d='M9 12h11l-3-3M23 20H12l3 3' stroke='white' stroke-width='2.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%233b82f6'/%3E%3Cstop offset='1' stop-color='%231d4ed8'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='512' height='512' rx='112' fill='url(%23g)'/%3E%3Cpath d='M112 192h272l-72-72M400 320H128l72 72' fill='none' stroke='white' stroke-width='48' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <style>
+/* Colors follow the app icon: its blue gradient (#3b82f6 to #1d4ed8) with blue-tinted neutrals */
 :root {
-  --bg: #f6f7f9; --card: #ffffff; --text: #1d2330; --muted: #667085; --line: #e3e6eb;
-  --accent: #2563eb; --accent-soft: #e8efff; --good: #15803d; --good-soft: #e7f6ec;
-  --warn: #b45309; --warn-soft: #fdf3e2; --bad: #c62828; --bad-soft: #fdeceb;
-  --busy: #2563eb; --busy-soft: #e8efff; --code: #f1f3f6;
+  --bg: #f3f6fc; --card: #ffffff; --text: #0f1b33; --muted: #5a6a86; --line: #dbe3f1;
+  --accent: #2563eb; --accent-soft: #e5edff; --good: #15803d; --good-soft: #e5f5eb;
+  --warn: #b45309; --warn-soft: #fdf2e1; --bad: #c62828; --bad-soft: #fdeceb;
+  --busy: #2563eb; --busy-soft: #e5edff; --code: #edf2fa;
+  --brand: linear-gradient(135deg, #3b82f6, #1d4ed8);
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #12151b; --card: #1a1f27; --text: #e6e9ef; --muted: #98a2b3; --line: #2b323d;
-    --accent: #6d9cff; --accent-soft: #1e2a44; --good: #4ade80; --good-soft: #15291d;
-    --warn: #fbbf24; --warn-soft: #2e2512; --bad: #f87171; --bad-soft: #321a1a;
-    --busy: #6d9cff; --busy-soft: #1e2a44; --code: #222833;
+    --bg: #0a1020; --card: #111a2e; --text: #e4eaf6; --muted: #93a3bf; --line: #223050;
+    --accent: #5b9bff; --accent-soft: #15254a; --good: #4ade80; --good-soft: #10291c;
+    --warn: #fbbf24; --warn-soft: #2c2412; --bad: #f87171; --bad-soft: #321a1f;
+    --busy: #5b9bff; --busy-soft: #15254a; --code: #18233b;
   }
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
 header { background: var(--card); border-bottom: 1px solid var(--line); }
+header::before { content: ""; display: block; height: 3px; background: var(--brand); }
 .wrap { max-width: 1040px; margin: 0 auto; padding: 0 16px; }
 .top { display: flex; align-items: center; gap: 12px; padding: 14px 0 10px; }
-.logo { width: 34px; height: 34px; border-radius: 9px; background: var(--accent); display: grid; place-items: center; flex: none; }
+.logo { width: 36px; height: 36px; flex: none; filter: drop-shadow(0 2px 6px rgba(29, 78, 216, .35)); }
 .top h1 { font-size: 18px; margin: 0; }
 .top p { margin: 0; color: var(--muted); font-size: 13px; }
 .pill { margin-left: auto; padding: 4px 12px; border-radius: 999px; font-size: 13px; font-weight: 600; white-space: nowrap; }
@@ -54,12 +57,15 @@ section[hidden] { display: none; }
 .tile .v { font-size: 22px; font-weight: 650; margin-top: 2px; }
 .tile .s { color: var(--muted); font-size: 12.5px; }
 .bar { height: 10px; background: var(--code); border-radius: 999px; overflow: hidden; margin: 12px 0 8px; }
-.bar > div { height: 100%; background: var(--accent); border-radius: 999px; transition: width .4s; }
+.bar > div { height: 100%; background: var(--brand); border-radius: 999px; transition: width .4s; }
 .muted { color: var(--muted); }
 .small { font-size: 13px; }
 button.btn { font: inherit; font-size: 14px; padding: 7px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--text); cursor: pointer; }
 button.btn:hover:not(:disabled) { border-color: var(--accent); }
-button.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.btn.primary { background: var(--brand); border-color: #1d4ed8; color: #fff; }
+button.btn.primary:hover:not(:disabled) { filter: brightness(1.08); }
+input[type=checkbox], input[type=radio] { accent-color: #2563eb; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 button.btn.danger { color: var(--bad); }
 button.btn:disabled { opacity: .5; cursor: default; }
 .table-wrap { overflow-x: auto; }
@@ -126,7 +132,11 @@ details summary { cursor: pointer; color: var(--accent); font-size: 14px; }
 <header>
   <div class="wrap">
     <div class="top">
-      <div class="logo"><svg width="20" height="20" viewBox="0 0 32 32" aria-hidden="true"><path d="M7 12h15l-4-4M25 20H10l4 4" stroke="#fff" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+      <svg class="logo" viewBox="0 0 512 512" aria-hidden="true">
+        <defs><linearGradient id="logo-bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#3b82f6"/><stop offset="1" stop-color="#1d4ed8"/></linearGradient></defs>
+        <rect width="512" height="512" rx="112" fill="url(#logo-bg)"/>
+        <path d="M112 192h272l-72-72M400 320H128l72 72" fill="none" stroke="#fff" stroke-width="48" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
       <div><h1>lsyncd-webui</h1><p>Live mirror to your backup server</p></div>
       <span id="pill" class="pill tone-muted">Loading…</span>
     </div>
@@ -353,6 +363,7 @@ function ago(ts) {
   if (s < 86400) return Math.round(s / 3600) + " h ago";
   return new Date(ts * 1000).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 }
+const dur = s => (s < 90 ? `${s} s` : s < 5400 ? `${Math.round(s / 60)} min` : `${(s / 3600).toFixed(1)} h`);
 const mbs = b => (b / 1e6).toFixed(b >= 100e6 ? 0 : 1) + " MB/s";
 const mbit = b => Math.round(b * 8 / 1e6) + " Mbit/s";
 const stamp = ts => (ts ? new Date(ts * 1000).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }) : "–");
@@ -519,6 +530,12 @@ function renderJob(st) {
         }
         if (job.bytes) bits.push(`${bytes(job.bytes)} sent`);
         if (job.bytes && job.speed) bits.push(esc(job.speed));
+        // Where rsync is, and what it waits for when it goes quiet, so a stall can be traced
+        const quiet = job.quiet >= 30;
+        const where = [];
+        if (job.now_at) where.push(`Now at <span class="mono">${esc(job.now_at)}</span>`);
+        if (quiet) where.push(`no progress for ${dur(job.quiet)}` + (job.waiting ? `, rsync is waiting for ${esc(job.waiting)}` : ""));
+        if (where.length) bits.push(`<span${job.quiet >= 120 ? ' style="color:var(--warn)"' : ""}>${where.join(", ")}</span>`);
       } else {
         if (job.phase) bits.push(esc(job.phase));
         bits.push(`${job.percent}%`);

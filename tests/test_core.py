@@ -106,27 +106,46 @@ class ScheduledTest(unittest.TestCase):
 class FullSyncProgressTest(unittest.TestCase):
     def test_scanning_then_comparing_moves_the_bar(self):
         jobs = server.Jobs()
-        jobs.info = {"folder": "Photos"}
-        jobs.progress = {"scanned": 0, "items": 0, "checked": 0, "bytes": 0, "sent_percent": 0, "speed": ""}
+        jobs.info = {"folder": "Photos", "state": "running", "kind": "full", "phase": ""}
+        jobs.progress = server.new_progress()
         before = list(server.LOG)
         jobs._on_progress("building file list ... ")
-        jobs._on_progress(" 300 files...")
-        jobs._push_progress(force=True)
-        self.assertEqual((jobs.info["phase"], jobs.info["scanned"], jobs.info["percent"]), ("Scanning", 300, 0))
+        for n in range(0, 1000, 100):
+            jobs._on_progress(f" {n} files...")
+        info = jobs.snapshot()  # always the latest count, also when rsync then goes quiet
+        self.assertEqual((info["phase"], info["scanned"], info["percent"], info["quiet"]), ("Scanning", 900, 0, 0))
         jobs._on_progress("400 files to consider")
         for i in range(100):
             jobs._on_progress(f"@lsw@ .f          1 0 d/f{i}")
         jobs._on_progress("@lsw@ *deleting   0 0 old")
         jobs._on_progress("     1,000,000  10%   40.00MB/s    0:00:01 (xfr#1, to-chk=10/400)")
-        jobs._push_progress(force=True)
-        info = jobs.info
+        info = jobs.snapshot()
         self.assertEqual((info["phase"], info["items"], info["checked"], info["percent"]),
                          ("Comparing and sending", 400, 100, 25))
         self.assertEqual((info["bytes"], info["speed"]), (1_000_000, "40.00MB/s"))
         jobs._on_progress("   300,000,000  60%   40.00MB/s    0:00:01 (xfr#2, to-chk=9/400)")
-        jobs._push_progress(force=True)
-        self.assertEqual(jobs.info["percent"], 60)  # bytes sent can be ahead of items compared
+        self.assertEqual(jobs.snapshot()["percent"], 60)  # bytes sent can be ahead of items compared
         self.assertEqual(list(server.LOG), before)  # none of this goes to the log
+        jobs.progress = {}
+        self.assertEqual(jobs.snapshot()["phase"], "")  # after rsync, the job's own phase shows again
+
+    def test_what_rsync_waits_for(self):
+        self.assertEqual(server.waiting_on("do_select"), "the backup server")
+        self.assertEqual(server.waiting_on("do_sys_poll"), "the backup server")
+        self.assertEqual(server.waiting_on("fuse_dev_do_read"), "the disk or file system")
+        self.assertEqual(server.waiting_on("folio_wait_bit_common"), "the disk or file system")
+        self.assertEqual(server.waiting_on("0"), "")
+        self.assertEqual(server.waiting_on("hrtimer_nanosleep"), "")
+
+    def test_where_rsync_is(self):
+        folder = os.path.join(server.DATA_DIR, "Documents", "2024")
+        proc = subprocess.Popen([sys.executable, "-c", "import os, sys, time; fd = os.open(sys.argv[1], os.O_RDONLY); time.sleep(5)", folder])
+        try:
+            time.sleep(0.3)
+            self.assertEqual(server.rsync_activity(proc.pid)["now_at"], "Documents/2024")
+        finally:
+            proc.kill()
+            proc.wait()
 
     def test_expected_items_come_from_the_last_count(self):
         os.makedirs(server.CONFIG_DIR, exist_ok=True)
@@ -221,7 +240,7 @@ class TransferTest(unittest.TestCase):
     def test_full_sync_reports_sent_files_without_logging_them(self):
         jobs = server.Jobs()
         jobs.info = {"folder": "Photos"}
-        jobs.progress = {"scanned": 0, "items": 0, "checked": 0, "bytes": 0, "sent_percent": 0, "speed": ""}
+        jobs.progress = server.new_progress()
         before = list(server.LOG)
         jobs._on_progress("@lsw@ <f+++++++++ 1234 1234 2024/img 1.jpg")
         jobs._on_progress("@lsw@ cd+++++++++ 0 0 2024/")

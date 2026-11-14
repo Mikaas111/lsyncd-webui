@@ -260,6 +260,7 @@ Then click **Apply**. The container picks the new paths up by itself and your se
 | Watched folders close to the limit | See *Large shares* above. |
 | **Changes waiting** is much higher than the rise in **Files copied** | Normal: a change can also be a new folder, a move, a deletion or a file that was already on the backup. **Files copied** only counts files whose contents were sent. |
 | A folder with many files shows 0% for a long time | rsync first scans the folder (**Scanning the main server: … items found**), then compares every item with the backup (**… of … items compared**). Both counts keep moving while it works. |
+| A full sync shows **no progress for …** | The task card shows where rsync is (**Now at …**) and what it waits for. *The disk or file system*: something in that folder answers slowly or not at all, such as a network or cloud mount, or a failing disk. *The backup server*: the backup is slow to keep up, or the connection stalled; look at the backup container's log. |
 | Syncing is slower than your internet connection | Run the speed test, see *Sync slower than expected?* above. |
 | Saving **Encryption: None** fails with "No connection to port 2223" | Update the backup container, and check that nothing blocks port 2223 between the servers. |
 | Saving a two-way folder says the container cannot write to it | Add the `/mnt-rw` path, see *Updating*. |

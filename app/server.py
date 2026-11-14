@@ -686,6 +686,59 @@ def rsync_file_line(line, folder_for):
     return kind
 
 
+def new_progress():
+    return {"active": True, "seen": time.monotonic(), "scanned": 0, "items": 0, "checked": 0,
+            "bytes": 0, "sent_percent": 0, "speed": ""}
+
+
+def sync_progress(p):
+    """Progress of the folder rsync is on, from the counts _on_progress keeps."""
+    items = p["items"]
+    # Items compared moves when little changed; bytes sent moves during a first upload of big files
+    compared = p["checked"] / items if items else 0.0
+    fraction = min(1.0, max(compared, p["sent_percent"] / 100))
+    return {
+        "phase": "Comparing and sending" if items else "Scanning",
+        "scanned": p["scanned"], "items": items, "checked": min(p["checked"], items) if items else 0,
+        "bytes": p["bytes"], "speed": p["speed"], "percent": int(fraction * 100),
+        "quiet": int(time.monotonic() - p["seen"]),
+    }
+
+
+def waiting_on(wchan):
+    """What a sleeping process waits for, from the kernel function it sleeps in."""
+    if not wchan or wchan == "0" or "nanosleep" in wchan:
+        return ""
+    if "select" in wchan or "poll" in wchan:
+        return "the backup server"  # rsync waits for its connection with select()
+    return "the disk or file system"
+
+
+def rsync_activity(pid):
+    """Where a running rsync is (the deepest folder or file it has open) and what it waits for."""
+    out = {}
+    paths = []
+    try:
+        for fd in os.listdir(f"/proc/{pid}/fd"):
+            try:
+                target = os.readlink(f"/proc/{pid}/fd/{fd}")
+            except OSError:
+                continue
+            if target.startswith("/") and not target.startswith(("/dev/", "/proc/")):
+                paths.append(target)
+    except OSError:
+        return out
+    if paths:
+        where = max(paths, key=len)
+        out["now_at"] = where[len(DATA_DIR) + 1:] if where.startswith(DATA_DIR + "/") else where
+    try:
+        with open(f"/proc/{pid}/wchan", encoding="utf-8") as f:
+            out["waiting"] = waiting_on(f.read().strip())
+    except OSError:
+        pass
+    return out
+
+
 class Daemon:
     """A long-running sync process that is restarted when it exits."""
 
@@ -895,14 +948,22 @@ class Jobs:
         self.proc = None
         self.stop_requested = False
         self.info = None
-        self.progress = {}
+        self.progress = {}  # counts of the folder rsync is on, while it runs
 
     def busy(self):
         return self.thread is not None and self.thread.is_alive()
 
     def snapshot(self):
         with self.lock:
-            return dict(self.info) if self.info else None
+            info = dict(self.info) if self.info else None
+        p = self.progress
+        if info and info["state"] == "running" and p.get("active"):
+            # Computed when asked, so the page always shows rsync's latest counts
+            info.update(sync_progress(p))
+            proc = self.proc
+            if proc is not None and proc.poll() is None:
+                info.update(rsync_activity(proc.pid))
+        return info
 
     def set(self, **changes):
         with self.lock:
@@ -993,23 +1054,24 @@ class Jobs:
             log("rsync", explain_ssh_error(text) or text)
 
     def _on_progress(self, line):
-        """Follow rsync through a folder: scanning the main server, then comparing and sending."""
+        """Follow rsync through a folder: scanning the main server, then comparing and sending.
+
+        Only counts here (rsync can report a million lines); snapshot() turns them into progress.
+        """
         p = self.progress
+        p["seen"] = time.monotonic()
         kind = rsync_file_line(line, lambda _: self.info and self.info["folder"])
         if kind:
             if kind != "*":  # deletions are not in the list of items to check
                 p["checked"] += 1
-            self._push_progress()
             return
         match = SCAN_RE.match(line)
         if match:
             p["scanned"] = int(match.group(1))
-            self._push_progress()
             return
         match = CONSIDER_RE.match(line)
         if match:
             p["items"] = int(match.group(1))
-            self._push_progress(force=True)
             return
         if line.strip() == "building file list ...":
             return
@@ -1019,24 +1081,6 @@ class Jobs:
             return
         p.update(bytes=int(re.sub(r"\D", "", match.group(1)) or 0), sent_percent=int(match.group(2)),
                  speed=match.group(3))
-        self._push_progress()
-
-    def _push_progress(self, force=False):
-        """Copy the counters into the job info, at most twice a second: rsync can report a million lines."""
-        p = self.progress
-        now = time.monotonic()
-        if not force and now - p.get("pushed", 0) < 0.5:
-            return
-        p["pushed"] = now
-        items = p["items"]
-        # Items compared moves when little changed; bytes sent moves during a first upload of big files
-        compared = p["checked"] / items if items else 0.0
-        fraction = min(1.0, max(compared, p["sent_percent"] / 100))
-        self.set(
-            phase="Comparing and sending" if items else "Scanning",
-            scanned=p["scanned"], items=items, checked=min(p["checked"], items) if items else 0,
-            bytes=p["bytes"], speed=p["speed"], percent=int(fraction * 100),
-        )
 
     @staticmethod
     def _expected_items(folder):
@@ -1059,9 +1103,8 @@ class Jobs:
         for index, folder in enumerate(folders, 1):
             if self.stop_requested:
                 break
-            self.progress = {"scanned": 0, "items": 0, "checked": 0, "bytes": 0, "sent_percent": 0, "speed": ""}
-            self.set(folder=folder, index=index, expected=self._expected_items(folder))
-            self._push_progress(force=True)
+            self.set(folder=folder, index=index, expected=self._expected_items(folder), percent=0,
+                     phase="Scanning", scanned=0, items=0, checked=0, bytes=0, speed="")
             src = source_dir(folder)
             with os.scandir(src) as entries:
                 empty = next(entries, None) is None
@@ -1074,8 +1117,9 @@ class Jobs:
             if s["delete"]:
                 cmd.append("--delete")
             cmd += [src + "/", f"{SSH_ALIAS}:{remote_dir(s, folder)}/"]
+            self.progress = new_progress()
             code = self._run_rsync(cmd, self._on_progress)
-            self._push_progress(force=True)
+            self.progress = {}
             if code in (0, 24):  # 24: some files vanished during the transfer
                 self.set(percent=100)
             elif self.stop_requested:
