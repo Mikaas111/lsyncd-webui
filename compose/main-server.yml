@@ -1,0 +1,15 @@
+# Main server: web UI + live sync.
+services:
+  lsyncd-webui:
+    image: ghcr.io/mikaas111/lsyncd-webui:latest
+    container_name: lsyncd-webui
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      ROLE: main
+      WEBUI_PORT: "8484"
+      WEBUI_PASSWORD: ""
+      TZ: Europe/Amsterdam
+    volumes:
+      - /mnt/user:/data:ro
+      - /mnt/user/appdata/lsyncd-webui:/config

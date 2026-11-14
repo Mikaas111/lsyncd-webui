@@ -1,0 +1,715 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lsyncd-webui</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232563eb'/%3E%3Cpath d='M9 12h11l-3-3M23 20H12l3 3' stroke='white' stroke-width='2.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<style>
+:root {
+  --bg: #f6f7f9; --card: #ffffff; --text: #1d2330; --muted: #667085; --line: #e3e6eb;
+  --accent: #2563eb; --accent-soft: #e8efff; --good: #15803d; --good-soft: #e7f6ec;
+  --warn: #b45309; --warn-soft: #fdf3e2; --bad: #c62828; --bad-soft: #fdeceb;
+  --busy: #2563eb; --busy-soft: #e8efff; --code: #f1f3f6;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151b; --card: #1a1f27; --text: #e6e9ef; --muted: #98a2b3; --line: #2b323d;
+    --accent: #6d9cff; --accent-soft: #1e2a44; --good: #4ade80; --good-soft: #15291d;
+    --warn: #fbbf24; --warn-soft: #2e2512; --bad: #f87171; --bad-soft: #321a1a;
+    --busy: #6d9cff; --busy-soft: #1e2a44; --code: #222833;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { background: var(--card); border-bottom: 1px solid var(--line); }
+.wrap { max-width: 1040px; margin: 0 auto; padding: 0 16px; }
+.top { display: flex; align-items: center; gap: 12px; padding: 14px 0 10px; }
+.logo { width: 34px; height: 34px; border-radius: 9px; background: var(--accent); display: grid; place-items: center; flex: none; }
+.top h1 { font-size: 18px; margin: 0; }
+.top p { margin: 0; color: var(--muted); font-size: 13px; }
+.pill { margin-left: auto; padding: 4px 12px; border-radius: 999px; font-size: 13px; font-weight: 600; white-space: nowrap; }
+nav { display: flex; gap: 4px; overflow-x: auto; }
+nav button { background: none; border: 0; border-bottom: 2px solid transparent; padding: 10px 12px; font: inherit; color: var(--muted); cursor: pointer; white-space: nowrap; }
+nav button.active { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+main { padding: 20px 0 48px; }
+section[hidden] { display: none; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px; margin-bottom: 16px; }
+.card h2 { font-size: 16px; margin: 0 0 4px; }
+.card > p.lead { margin: 0 0 14px; color: var(--muted); font-size: 14px; }
+.row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.spread { justify-content: space-between; }
+.banner { border-left: 4px solid var(--muted); }
+.banner h2 { font-size: 18px; }
+.banner p { margin: 2px 0 0; color: var(--muted); }
+.tone-good { color: var(--good); background: var(--good-soft); border-color: var(--good); }
+.tone-warn { color: var(--warn); background: var(--warn-soft); border-color: var(--warn); }
+.tone-bad { color: var(--bad); background: var(--bad-soft); border-color: var(--bad); }
+.tone-busy { color: var(--busy); background: var(--busy-soft); border-color: var(--busy); }
+.tone-muted { color: var(--muted); background: var(--code); border-color: var(--muted); }
+.banner.tone-good, .banner.tone-warn, .banner.tone-bad, .banner.tone-busy, .banner.tone-muted { background: var(--card); color: var(--text); }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+.tile { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+.tile .k { color: var(--muted); font-size: 13px; }
+.tile .v { font-size: 22px; font-weight: 650; margin-top: 2px; }
+.tile .s { color: var(--muted); font-size: 12.5px; }
+.bar { height: 10px; background: var(--code); border-radius: 999px; overflow: hidden; margin: 12px 0 8px; }
+.bar > div { height: 100%; background: var(--accent); border-radius: 999px; transition: width .4s; }
+.muted { color: var(--muted); }
+.small { font-size: 13px; }
+button.btn { font: inherit; font-size: 14px; padding: 7px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--text); cursor: pointer; }
+button.btn:hover:not(:disabled) { border-color: var(--accent); }
+button.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.btn.danger { color: var(--bad); }
+button.btn:disabled { opacity: .5; cursor: default; }
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: 12.5px; color: var(--muted); font-weight: 600; }
+td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
+th.group { text-align: center; border-bottom: 0; padding-bottom: 0; }
+.badge { display: inline-block; padding: 1px 9px; border-radius: 999px; font-size: 12.5px; font-weight: 600; white-space: nowrap; }
+code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
+code { background: var(--code); padding: 1px 5px; border-radius: 5px; }
+label.field { display: block; margin-bottom: 14px; }
+label.field > span { display: block; font-weight: 600; font-size: 14px; margin-bottom: 4px; }
+label.field small { display: block; color: var(--muted); font-size: 12.5px; margin-top: 3px; }
+input[type=text], input[type=number], input[type=time], input[type=password], textarea {
+  width: 100%; font: inherit; font-size: 14px; padding: 8px 10px; border: 1px solid var(--line);
+  border-radius: 8px; background: var(--bg); color: var(--text);
+}
+textarea { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
+.check { display: flex; gap: 10px; align-items: flex-start; margin-bottom: 14px; }
+.check input { margin-top: 4px; }
+.check span { font-weight: 600; font-size: 14px; }
+.check small { display: block; color: var(--muted); font-size: 12.5px; font-weight: 400; }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 0 20px; }
+.tree, .tree ul { list-style: none; margin: 0; padding: 0; }
+.tree ul { padding-left: 22px; }
+.tree li > div { display: flex; align-items: center; gap: 6px; padding: 3px 0; }
+.tree .toggle { width: 22px; height: 22px; border: 0; background: none; color: var(--muted); cursor: pointer; border-radius: 5px; flex: none; transition: transform .15s; }
+.tree .toggle.open { transform: rotate(90deg); }
+.tree .toggle:hover { background: var(--code); }
+.tree .spacer { width: 22px; flex: none; }
+.tree label { display: flex; align-items: center; gap: 7px; cursor: pointer; }
+.tree-box { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; max-height: 460px; overflow: auto; }
+.selected-list { list-style: none; padding: 0; margin: 0; }
+.selected-list li { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+.selected-list li .grow { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 14px; }
+.chip { font: inherit; font-size: 13px; padding: 3px 10px; border: 1px dashed var(--line); border-radius: 999px; background: none; color: var(--text); cursor: pointer; }
+.chip:hover { border-color: var(--accent); }
+pre.log { background: var(--code); border-radius: 10px; padding: 12px; height: 520px; overflow: auto; margin: 0; font-size: 12.5px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.log .src { color: var(--accent); }
+.diffs { max-height: 360px; overflow: auto; margin-top: 10px; }
+details summary { cursor: pointer; color: var(--accent); font-size: 14px; }
+.toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); padding: 10px 16px; border-radius: 10px; background: var(--text); color: var(--bg); font-size: 14px; box-shadow: 0 6px 24px rgba(0,0,0,.2); max-width: calc(100% - 32px); z-index: 10; }
+.toast.error { background: var(--bad); color: #fff; }
+.unsaved { color: var(--warn); font-size: 13px; font-weight: 600; }
+.keybox { width: 100%; height: 70px; resize: none; }
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <div class="top">
+      <div class="logo"><svg width="20" height="20" viewBox="0 0 32 32" aria-hidden="true"><path d="M7 12h15l-4-4M25 20H10l4 4" stroke="#fff" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+      <div><h1>lsyncd-webui</h1><p>Live mirror to your backup server</p></div>
+      <span id="pill" class="pill tone-muted">Loading…</span>
+    </div>
+    <nav>
+      <button data-tab="overview" class="active">Overview</button>
+      <button data-tab="folders">Folders</button>
+      <button data-tab="excludes">Excludes</button>
+      <button data-tab="settings">Settings</button>
+      <button data-tab="log">Log</button>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <!-- Overview -->
+  <section id="tab-overview">
+    <div id="banner" class="card banner"><h2>Loading…</h2><p></p></div>
+
+    <div class="card">
+      <h2>Live sync</h2>
+      <p class="lead">lsyncd watches the selected folders and sends every change to the backup server.</p>
+      <div class="tiles">
+        <div class="tile"><div class="k">Status</div><div class="v" id="t-state">–</div><div class="s" id="t-state-s"></div></div>
+        <div class="tile"><div class="k">Waiting to be sent</div><div class="v" id="t-queue">–</div><div class="s" id="t-queue-s"></div></div>
+        <div class="tile"><div class="k">Watched folders</div><div class="v" id="t-watch">–</div><div class="s" id="t-watch-s"></div></div>
+        <div class="tile"><div class="k">Last change sent</div><div class="v" id="t-last">–</div><div class="s" id="t-last-s"></div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row spread">
+        <h2 id="job-title">Tasks</h2>
+        <div class="row">
+          <button class="btn" data-job="full">Full sync now</button>
+          <button class="btn" data-job="count">Count files</button>
+          <button class="btn" data-job="compare">Compare</button>
+          <button class="btn danger" id="job-stop" hidden>Stop</button>
+        </div>
+      </div>
+      <div id="job-body" class="muted small" style="margin-top:8px">No task has run since the container started.</div>
+      <div id="history" class="small muted" style="margin-top:12px"></div>
+    </div>
+
+    <div class="card">
+      <h2>Main server vs backup</h2>
+      <p class="lead">Folders and files on both servers, counted with the same excludes. Counted after every full sync, or when you click <b>Count files</b>.</p>
+      <div class="table-wrap" id="counts">–</div>
+      <div id="counts-foot" class="small muted" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card">
+      <h2>Last comparison</h2>
+      <p class="lead">Compare checks every file's name, size and date on both servers without changing anything.</p>
+      <div id="compare">Not compared yet.</div>
+    </div>
+  </section>
+
+  <!-- Folders -->
+  <section id="tab-folders" hidden>
+    <div class="card">
+      <div class="row spread">
+        <h2>Folders to mirror</h2>
+        <div class="row"><span class="unsaved" id="folders-dirty" hidden>Unsaved changes</span><button class="btn primary" id="save-folders">Save</button></div>
+      </div>
+      <p class="lead">Tick the folders that must be on the backup. A ticked folder includes everything inside it. Removing a folder here stops syncing it; its copy on the backup stays.</p>
+      <div class="grid2">
+        <div>
+          <div class="small muted" style="margin-bottom:6px">On the main server</div>
+          <div class="tree-box"><ul class="tree" id="tree"><li class="muted small">Loading…</li></ul></div>
+        </div>
+        <div>
+          <div class="small muted" style="margin-bottom:6px">Selected, and where each one goes on the backup</div>
+          <ul class="selected-list" id="selected"></ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Excludes -->
+  <section id="tab-excludes" hidden>
+    <div class="card">
+      <div class="row spread">
+        <h2>Excludes</h2>
+        <div class="row"><span class="unsaved" id="excludes-dirty" hidden>Unsaved changes</span><button class="btn primary" id="save-excludes">Save</button></div>
+      </div>
+      <p class="lead">Files and folders matching these patterns are never sent. One pattern per line.</p>
+      <textarea id="excludes" rows="10" spellcheck="false"></textarea>
+      <div class="small muted" style="margin-top:10px">Common patterns, click to add:</div>
+      <div class="chips" id="chips"></div>
+      <div class="table-wrap">
+        <table>
+          <tr><th>Pattern</th><th>Matches</th></tr>
+          <tr><td><code>*.tmp</code></td><td>Every file ending in .tmp, in any folder</td></tr>
+          <tr><td><code>cache/</code></td><td>Every folder named cache, with everything in it</td></tr>
+          <tr><td><code>/Downloads/</code></td><td>Only the Downloads folder directly inside a selected folder</td></tr>
+          <tr><td><code>Projects/*/build/</code></td><td>A build folder one level below Projects</td></tr>
+        </table>
+      </div>
+      <p class="small muted">Files that were already on the backup before you excluded them stay there. Run a full sync after changing excludes.</p>
+    </div>
+  </section>
+
+  <!-- Settings -->
+  <section id="tab-settings" hidden>
+    <div class="card">
+      <div class="row spread">
+        <h2>Settings</h2>
+        <div class="row"><span class="unsaved" id="settings-dirty" hidden>Unsaved changes</span><button class="btn primary" id="save-settings">Save</button></div>
+      </div>
+      <div class="grid2" style="margin-top:12px">
+        <div>
+          <h3 class="small muted">Backup server</h3>
+          <label class="field"><span>Address</span><input type="text" name="host" placeholder="10.252.100.2"><small>VPN or LAN address of the backup server.</small></label>
+          <label class="field"><span>SSH port</span><input type="number" name="port" min="1" max="65535"><small>2222 for the lsyncd-webui backup container.</small></label>
+          <label class="field"><span>User</span><input type="text" name="user"></label>
+          <label class="field"><span>Target folder on the backup</span><input type="text" name="target"><small>Inside the backup container this is <code>/backup</code>.</small></label>
+        </div>
+        <div>
+          <h3 class="small muted">Sync</h3>
+          <label class="field"><span>Delay (seconds)</span><input type="number" name="delay" min="1" max="3600"><small>Changes are collected this long, then sent together.</small></label>
+          <label class="check"><input type="checkbox" name="delete"><span>Mirror deletions<small>Files deleted on the main server are deleted on the backup too, so the backup is an exact copy.</small></span></label>
+          <label class="check"><input type="checkbox" name="compress"><span>Compress during transfer<small>Saves bandwidth, costs CPU on both servers.</small></span></label>
+          <label class="field"><span>Bandwidth limit (KB/s)</span><input type="number" name="bwlimit" min="0"><small>0 means no limit.</small></label>
+          <label class="field"><span>Nightly full sync</span><input type="time" name="nightly"><small>Compares everything once a day and fixes what live sync missed. Leave empty to turn off.</small></label>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>SSH key</h2>
+      <p class="lead">Paste this public key into <code>AUTHORIZED_KEY</code> of the backup container.</p>
+      <textarea class="keybox" id="pubkey" readonly></textarea>
+      <div class="row" style="margin-top:10px">
+        <button class="btn" id="copy-key">Copy key</button>
+        <button class="btn" id="test-ssh">Test connection</button>
+        <button class="btn" id="forget-host">Forget backup host key</button>
+        <button class="btn danger" id="new-key">Create new key</button>
+      </div>
+      <div id="ssh-result" class="small" style="margin-top:10px"></div>
+    </div>
+  </section>
+
+  <!-- Log -->
+  <section id="tab-log" hidden>
+    <div class="card">
+      <div class="row spread">
+        <h2>Log</h2>
+        <label class="row small muted"><input type="checkbox" id="log-follow" checked> Follow new lines</label>
+      </div>
+      <pre class="log" id="log"></pre>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = (sel, el = document) => el.querySelector(sel);
+const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
+const nf = new Intl.NumberFormat("en-US");
+const app = { config: null, status: null, selected: new Set(), logSeq: 0, tab: "overview" };
+
+async function api(path, options = {}) {
+  const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...options });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || data.message || res.statusText);
+  return data;
+}
+const post = (path, body = {}) => api(path, { method: "POST", body: JSON.stringify(body) });
+
+function esc(text) {
+  return String(text ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+const num = n => (n == null ? "–" : nf.format(n));
+function bytes(b) {
+  if (b == null) return "–";
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+  let i = 0;
+  while (b >= 1000 && i < units.length - 1) { b /= 1000; i++; }
+  return (i ? b.toFixed(b < 10 ? 2 : 1) : b) + " " + units[i];
+}
+function ago(ts) {
+  if (!ts) return "never";
+  const s = Date.now() / 1000 - ts;
+  if (s < 45) return "just now";
+  if (s < 3600) return Math.round(s / 60) + " min ago";
+  if (s < 86400) return Math.round(s / 3600) + " h ago";
+  return new Date(ts * 1000).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+}
+const stamp = ts => (ts ? new Date(ts * 1000).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }) : "–");
+
+let toastTimer;
+function toast(message, error = false) {
+  let el = $(".toast");
+  if (!el) { el = document.createElement("div"); document.body.append(el); }
+  el.className = "toast" + (error ? " error" : "");
+  el.textContent = message;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.remove(), error ? 7000 : 3500);
+}
+
+/* Tabs */
+function showTab(name) {
+  app.tab = name;
+  $$("nav button").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
+  $$("main > section").forEach(s => (s.hidden = s.id !== "tab-" + name));
+  if (name === "folders" && !$("#tree").dataset.loaded) loadTree();
+  if (name === "log") pollLog();
+  try { localStorage.setItem("tab", name); } catch (e) {}
+}
+$$("nav button").forEach(b => b.addEventListener("click", () => showTab(b.dataset.tab)));
+
+/* Overview */
+function bannerFor(st) {
+  const job = st.job, l = st.lsyncd;
+  if (!st.configured) return ["muted", "Not set up yet", "Set the backup server under Settings, then choose folders under Folders."];
+  if (job && job.state === "running") {
+    const where = job.folder ? ` (folder ${job.index} of ${job.total}: ${job.folder})` : "";
+    return ["busy", `${job.name} in progress`, (job.phase || "Working") + where + ". Live sync keeps running meanwhile."];
+  }
+  if (l.wanted && !l.running) return ["bad", "Live sync is not running", l.last_error || "lsyncd stopped. It restarts automatically."];
+  if (st.last_full && !st.last_full.ok) return ["warn", "Last full sync did not complete", st.last_full.message];
+  if (l.running) return ["good", "Live: backup follows the main server", `Changes reach the backup within about ${st.settings.delay} seconds.`];
+  return ["muted", "Stopped", ""];
+}
+
+function renderOverview(st) {
+  const [tone, title, text] = bannerFor(st);
+  const banner = $("#banner");
+  banner.className = "card banner tone-" + tone;
+  banner.innerHTML = `<h2>${esc(title)}</h2><p>${esc(text)}</p>`;
+  const pill = $("#pill");
+  pill.className = "pill tone-" + tone;
+  pill.textContent = { good: "In sync", busy: "Working", bad: "Problem", warn: "Attention", muted: "Not active" }[tone];
+
+  const l = st.lsyncd;
+  $("#t-state").textContent = l.running ? "Running" : "Stopped";
+  $("#t-state-s").textContent = l.running ? "since " + stamp(l.since) : (l.last_error || "");
+  $("#t-queue").textContent = l.running ? num(l.queue ?? 0) : "–";
+  $("#t-queue-s").textContent = l.busy ? "sending now" : (l.running ? "nothing in transit" : "");
+  $("#t-watch").textContent = num(l.watching);
+  const limit = st.inotify_max;
+  const near = limit && l.watching && l.watching > limit * 0.9;
+  $("#t-watch-s").innerHTML = limit ? (near ? `<span style="color:var(--warn)">close to the limit of ${num(limit)}</span>` : `limit ${num(limit)}`) : "";
+  $("#t-last").textContent = ago(l.last_activity);
+  $("#t-last-s").textContent = l.last_activity ? stamp(l.last_activity) : "";
+
+  renderJob(st);
+  renderCounts(st);
+  renderCompare(st);
+}
+
+function renderJob(st) {
+  const job = st.job;
+  const running = job && job.state === "running";
+  $$("[data-job]").forEach(b => (b.disabled = running || !st.configured));
+  $("#job-stop").hidden = !running;
+  const body = $("#job-body");
+  if (!job) {
+    body.className = "muted small";
+    body.textContent = "No task has run since the container started.";
+  } else {
+    const states = { running: ["busy", "Running"], done: ["good", "Done"], failed: ["bad", "Failed"], stopped: ["warn", "Stopped"] };
+    const [tone, label] = states[job.state] || ["muted", job.state];
+    let html = `<div class="row"><b>${esc(job.name)}</b><span class="badge tone-${tone}">${label}</span>`;
+    if (job.folder) html += `<span class="muted small">Folder ${job.index} of ${job.total}: ${esc(job.folder)}</span>`;
+    html += `</div>`;
+    if (running) {
+      html += `<div class="bar"><div style="width:${Math.max(2, job.percent)}%"></div></div>`;
+      const bits = [`${job.percent}%`];
+      if (job.phase) bits.unshift(esc(job.phase));
+      if (job.kind === "full" && job.phase === "Transferring") {
+        bits.push(`${bytes(job.bytes)} sent`);
+        if (job.speed) bits.push(esc(job.speed));
+        if (job.eta) bits.push(`${esc(job.eta)} left`);
+        if (job.files) bits.push(`${num(job.checked)} of ${num(job.files)} items checked`);
+      }
+      html += `<div class="small muted">${bits.join(" · ")}</div>`;
+    } else {
+      html += `<div class="small" style="margin-top:6px">${esc(job.message)} <span class="muted">${stamp(job.finished)}</span></div>`;
+    }
+    body.className = "";
+    body.innerHTML = html;
+  }
+  const h = [];
+  if (st.last_full) h.push(`Last full sync: ${stamp(st.last_full.time)}, ${esc(st.last_full.message)}`);
+  if (st.settings.nightly) h.push(`Next full sync every night at ${esc(st.settings.nightly)}`);
+  $("#history").innerHTML = h.join("<br>");
+}
+
+function countStatus(m, b) {
+  if (!m || m.missing) return ["bad", "Missing on main"];
+  if (!b) return ["muted", "Not counted"];
+  if (b.missing) return ["bad", "Missing on backup"];
+  const dd = b.dirs - m.dirs, df = b.files - m.files;
+  const db = b.bytes == null || m.bytes == null ? 0 : b.bytes - m.bytes;
+  if (dd === 0 && df === 0 && db === 0) return ["good", "Identical"];
+  const sign = d => (d > 0 ? "+" : "−");
+  const part = (d, one, many) => (d ? `${sign(d)}${num(Math.abs(d))} ${Math.abs(d) === 1 ? one : many}` : "");
+  const parts = [part(df, "file", "files"), part(dd, "folder", "folders")].filter(Boolean);
+  if (db) parts.push(`${sign(db)}${bytes(Math.abs(db))}`);
+  return ["warn", "Backup " + parts.join(", ")];
+}
+
+function renderCounts(st) {
+  const c = st.counts;
+  const box = $("#counts"), foot = $("#counts-foot");
+  if (!c || !c.folders || !Object.keys(c.folders).length) {
+    box.innerHTML = `<span class="muted small">Not counted yet. Click <b>Count files</b>.</span>`;
+    foot.textContent = "";
+    return;
+  }
+  const rows = [];
+  const total = { m: { dirs: 0, files: 0, bytes: 0 }, b: { dirs: 0, files: 0, bytes: 0 } };
+  let allSame = true;
+  for (const [folder, v] of Object.entries(c.folders)) {
+    const m = v.main || {}, b = v.backup || null;
+    const [tone, label] = countStatus(v.main, b);
+    if (tone !== "good") allSame = false;
+    for (const k of ["dirs", "files", "bytes"]) {
+      total.m[k] += m[k] || 0;
+      total.b[k] += (b && b[k]) || 0;
+    }
+    rows.push(`<tr><td>${esc(folder)}</td>
+      <td class="n">${num(m.dirs)}</td><td class="n">${num(m.files)}</td><td class="n">${bytes(m.bytes)}</td>
+      <td class="n">${num(b && b.dirs)}</td><td class="n">${num(b && b.files)}</td><td class="n">${bytes(b && b.bytes)}</td>
+      <td><span class="badge tone-${tone}">${esc(label)}</span></td></tr>`);
+  }
+  if (rows.length > 1) {
+    rows.push(`<tr><td><b>Total</b></td>
+      <td class="n"><b>${num(total.m.dirs)}</b></td><td class="n"><b>${num(total.m.files)}</b></td><td class="n"><b>${bytes(total.m.bytes)}</b></td>
+      <td class="n"><b>${num(total.b.dirs)}</b></td><td class="n"><b>${num(total.b.files)}</b></td><td class="n"><b>${bytes(total.b.bytes)}</b></td>
+      <td><span class="badge tone-${allSame ? "good" : "warn"}">${allSame ? "Identical" : "Differs"}</span></td></tr>`);
+  }
+  box.innerHTML = `<table>
+    <tr><th></th><th class="group" colspan="3">Main server</th><th class="group" colspan="3">Backup server</th><th></th></tr>
+    <tr><th>Folder</th><th class="n">Folders</th><th class="n">Files</th><th class="n">Size</th><th class="n">Folders</th><th class="n">Files</th><th class="n">Size</th><th>Status</th></tr>
+    ${rows.join("")}</table>`;
+  const f = [`Counted ${stamp(c.time)}`];
+  if (c.disk_main) f.push(`free on main: ${bytes(c.disk_main.free)} of ${bytes(c.disk_main.total)}`);
+  if (c.disk_backup) f.push(`free on backup: ${bytes(c.disk_backup.free)} of ${bytes(c.disk_backup.total)}`);
+  if (c.error) f.push(`<span style="color:var(--bad)">${esc(c.error)}</span>`);
+  foot.innerHTML = f.join(" · ");
+}
+
+function diffKind(line) {
+  if (line.startsWith("*deleting")) return ["Only on backup", line.slice(9).trim()];
+  const code = line.slice(0, 11), path = line.slice(12);
+  if (code[1] === "d" && code.includes("+++")) return ["Folder missing on backup", path];
+  if (code.slice(2).startsWith("+++")) return ["Missing on backup", path];
+  return ["Different", path];
+}
+
+function renderCompare(st) {
+  const c = st.last_compare, box = $("#compare");
+  if (!c) { box.innerHTML = `<span class="muted small">Not compared yet. Click <b>Compare</b>.</span>`; return; }
+  const key = c.time + ":" + c.differences;
+  if (box.dataset.key === key) return;
+  box.dataset.key = key;
+  let html;
+  if (c.problems && c.problems.length) html = `<span class="badge tone-bad">Could not compare</span> ${esc(c.problems.join(", "))}`;
+  else if (c.differences === 0) html = `<span class="badge tone-good">Identical</span> No differences in ${num(c.folders.length)} folder(s).`;
+  else html = `<span class="badge tone-warn">${num(c.differences)} difference(s)</span> A full sync fixes these.`;
+  html += ` <span class="muted small">${stamp(c.time)}</span>`;
+  if (c.differences) html += `<details id="diff-details"><summary>Show differences</summary><div class="diffs" id="diff-list">Loading…</div></details>`;
+  box.innerHTML = html;
+  const details = $("#diff-details");
+  if (details) details.addEventListener("toggle", loadDiffs, { once: true });
+}
+
+async function loadDiffs() {
+  const data = await api("/api/compare");
+  const lines = data.lines || [];
+  const rows = lines.map(({ folder, line }) => {
+    const [kind, path] = diffKind(line);
+    return `<tr><td><span class="badge tone-${kind === "Different" ? "warn" : "bad"}">${esc(kind)}</span></td><td class="mono">${esc(folder + "/" + path)}</td></tr>`;
+  });
+  const more = data.differences > lines.length ? `<p class="small muted">Showing the first ${num(lines.length)} of ${num(data.differences)}.</p>` : "";
+  $("#diff-list").innerHTML = `<table>${rows.join("")}</table>${more}`;
+}
+
+$$("[data-job]").forEach(b => b.addEventListener("click", async () => {
+  try { await post("/api/jobs/" + b.dataset.job); refresh(); } catch (e) { toast(e.message, true); }
+}));
+$("#job-stop").addEventListener("click", async () => { await post("/api/jobs/stop"); refresh(); });
+
+/* Folders */
+function covered(path) {
+  for (const s of app.selected) if (path !== s && path.startsWith(s + "/")) return true;
+  return false;
+}
+function markDirty(id, dirty = true) { $(id).hidden = !dirty; }
+
+async function loadChildren(path, ul) {
+  ul.innerHTML = `<li class="muted small">Loading…</li>`;
+  try {
+    const data = await api("/api/browse?path=" + encodeURIComponent(path));
+    ul.innerHTML = "";
+    if (data.error) ul.innerHTML = `<li class="small" style="color:var(--bad)">${esc(data.error)}</li>`;
+    else if (!data.dirs.length) ul.innerHTML = `<li class="muted small">No folders here</li>`;
+    for (const d of data.dirs) ul.append(treeNode(d));
+  } catch (e) {
+    ul.innerHTML = `<li class="small" style="color:var(--bad)">${esc(e.message)}</li>`;
+  }
+}
+
+function treeNode(d) {
+  const li = document.createElement("li");
+  const row = document.createElement("div");
+  const toggle = document.createElement(d.children ? "button" : "span");
+  toggle.className = d.children ? "toggle" : "spacer";
+  if (d.children) { toggle.textContent = "▸"; toggle.setAttribute("aria-label", "Open " + d.name); }
+  const label = document.createElement("label");
+  const box = document.createElement("input");
+  box.type = "checkbox";
+  box.dataset.path = d.path;
+  label.append(box, document.createTextNode(d.name));
+  row.append(toggle, label);
+  li.append(row);
+  const ul = document.createElement("ul");
+  ul.hidden = true;
+  li.append(ul);
+  if (d.children) toggle.addEventListener("click", () => {
+    ul.hidden = !ul.hidden;
+    toggle.classList.toggle("open", !ul.hidden);
+    if (!ul.hidden && !ul.dataset.loaded) { ul.dataset.loaded = "1"; loadChildren(d.path, ul).then(syncTree); }
+  });
+  box.addEventListener("change", () => {
+    if (box.checked) {
+      for (const s of [...app.selected]) if (s.startsWith(d.path + "/")) app.selected.delete(s);
+      app.selected.add(d.path);
+    } else app.selected.delete(d.path);
+    markDirty("#folders-dirty");
+    syncTree();
+    renderSelected();
+  });
+  return li;
+}
+
+function syncTree() {
+  $$("#tree input[data-path]").forEach(box => {
+    const p = box.dataset.path, under = covered(p);
+    box.checked = app.selected.has(p) || under;
+    box.disabled = under;
+  });
+}
+
+function renderSelected() {
+  const list = $("#selected");
+  const target = (app.config && app.config.target) || "/backup";
+  const items = [...app.selected].sort();
+  if (!items.length) { list.innerHTML = `<li class="muted small">Nothing selected yet.</li>`; return; }
+  list.innerHTML = items.map(p => `<li><div class="grow"><b>${esc(p)}</b><div class="small muted">→ ${esc(target.replace(/\/$/, "") + "/" + p)}</div></div><button class="btn" data-remove="${esc(p)}">Remove</button></li>`).join("");
+  $$("[data-remove]", list).forEach(b => b.addEventListener("click", () => {
+    app.selected.delete(b.dataset.remove);
+    markDirty("#folders-dirty");
+    syncTree();
+    renderSelected();
+  }));
+}
+
+async function loadTree() {
+  const tree = $("#tree");
+  tree.dataset.loaded = "1";
+  await loadChildren("", tree);
+  syncTree();
+}
+
+/* Excludes */
+const COMMON = ["*.tmp", "*.part", "*.partial~", "Thumbs.db", ".DS_Store", "desktop.ini", ".Recycle.Bin/", "@eaDir/", ".Trash-*/"];
+function renderChips() {
+  $("#chips").innerHTML = COMMON.map(p => `<button class="chip" data-pattern="${esc(p)}">${esc(p)}</button>`).join("");
+  $$("#chips .chip").forEach(c => c.addEventListener("click", () => {
+    const ta = $("#excludes");
+    const lines = ta.value.split("\n").map(s => s.trim()).filter(Boolean);
+    if (!lines.includes(c.dataset.pattern)) { lines.push(c.dataset.pattern); ta.value = lines.join("\n"); markDirty("#excludes-dirty"); }
+  }));
+}
+$("#excludes").addEventListener("input", () => markDirty("#excludes-dirty"));
+
+/* Settings */
+function fillSettings(s) {
+  for (const el of $$("#tab-settings [name]")) {
+    if (el.type === "checkbox") el.checked = !!s[el.name];
+    else el.value = s[el.name] ?? "";
+  }
+}
+function readSettings() {
+  const out = {};
+  for (const el of $$("#tab-settings [name]")) {
+    if (el.type === "checkbox") out[el.name] = el.checked;
+    else if (el.type === "number") out[el.name] = el.value === "" ? "" : Number(el.value);
+    else out[el.name] = el.value.trim();
+  }
+  return out;
+}
+$$("#tab-settings [name]").forEach(el => el.addEventListener("input", () => markDirty("#settings-dirty")));
+
+async function save(changes, dirtyId) {
+  const body = { ...app.config, ...changes };
+  try {
+    const res = await post("/api/config", body);
+    app.config = res.settings;
+    app.selected = new Set(app.config.folders);
+    markDirty(dirtyId, false);
+    toast(res.message);
+    syncTree();
+    renderSelected();
+    refresh();
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+$("#save-folders").addEventListener("click", () => save({ folders: [...app.selected] }, "#folders-dirty"));
+$("#save-excludes").addEventListener("click", () => save({ excludes: $("#excludes").value.split("\n").map(s => s.trim()).filter(Boolean) }, "#excludes-dirty"));
+$("#save-settings").addEventListener("click", () => save(readSettings(), "#settings-dirty"));
+
+$("#copy-key").addEventListener("click", async () => {
+  const ta = $("#pubkey");
+  try { await navigator.clipboard.writeText(ta.value); }
+  catch (e) { ta.select(); document.execCommand("copy"); }
+  toast("Public key copied.");
+});
+$("#test-ssh").addEventListener("click", async () => {
+  const out = $("#ssh-result");
+  out.innerHTML = `<span class="muted">Connecting…</span>`;
+  try {
+    const r = await post("/api/ssh/test");
+    out.innerHTML = `<span class="badge tone-${r.ok ? "good" : "bad"}">${r.ok ? "Connected" : "Failed"}</span> ${esc(r.message)}` +
+      (r.output ? `<pre class="mono small muted" style="white-space:pre-wrap;margin:8px 0 0">${esc(r.output)}</pre>` : "");
+  } catch (e) { out.textContent = e.message; }
+});
+$("#forget-host").addEventListener("click", async () => {
+  if (!confirm("Forget the backup server's host key? Only do this if you rebuilt or moved the backup container.")) return;
+  await post("/api/ssh/forget-host");
+  toast("Host key forgotten. It is learned again on the next connection.");
+});
+$("#new-key").addEventListener("click", async () => {
+  if (!confirm("Create a new key? The old key stops working, so you must paste the new one into the backup container.")) return;
+  const r = await post("/api/ssh/new-key");
+  $("#pubkey").value = r.public_key;
+  toast("New key created. Paste it into the backup container.");
+});
+
+/* Log */
+let logTimer;
+async function pollLog() {
+  clearTimeout(logTimer);
+  if (app.tab !== "log") return;
+  try {
+    const data = await api("/api/log?since=" + app.logSeq);
+    if (data.lines.length) {
+      const pre = $("#log");
+      const frag = document.createDocumentFragment();
+      for (const l of data.lines) {
+        const line = document.createElement("div");
+        line.innerHTML = `<span class="muted">${esc(l.time)}</span> <span class="src">[${esc(l.source)}]</span> ${esc(l.text)}`;
+        frag.append(line);
+      }
+      pre.append(frag);
+      while (pre.childNodes.length > 1500) pre.firstChild.remove();
+      app.logSeq = data.lines[data.lines.length - 1].seq;
+      if ($("#log-follow").checked) pre.scrollTop = pre.scrollHeight;
+    }
+  } catch (e) {}
+  logTimer = setTimeout(pollLog, 3000);
+}
+
+/* Polling */
+let statusTimer;
+async function refresh() {
+  clearTimeout(statusTimer);
+  try {
+    app.status = await api("/api/status");
+    renderOverview(app.status);
+  } catch (e) {
+    $("#pill").className = "pill tone-bad";
+    $("#pill").textContent = "Offline";
+  }
+  statusTimer = setTimeout(refresh, 2000);
+}
+
+async function init() {
+  const data = await api("/api/config");
+  app.config = data.settings;
+  app.selected = new Set(app.config.folders);
+  fillSettings(app.config);
+  $("#excludes").value = app.config.excludes.join("\n");
+  $("#pubkey").value = data.public_key;
+  renderChips();
+  renderSelected();
+  let tab = "overview";
+  try { tab = localStorage.getItem("tab") || tab; } catch (e) {}
+  showTab($("#tab-" + tab) ? tab : "overview");
+  refresh();
+}
+init().catch(e => toast(e.message, true));
+</script>
+</body>
+</html>

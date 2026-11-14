@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>lsyncd-webui-backup</Name>
+  <Repository>ghcr.io/mikaas111/lsyncd-webui:latest</Repository>
+  <Network>host</Network>
+  <Privileged>false</Privileged>
+  <Shell>sh</Shell>
+  <Support>https://github.com/Mikaas111/lsyncd-webui/issues</Support>
+  <Project>https://github.com/Mikaas111/lsyncd-webui</Project>
+  <Overview>Backup server side of lsyncd-webui. A small SSH server that only accepts the main server's key and writes the mirror into the backup folder.</Overview>
+  <Category>Backup: Tools:Utilities</Category>
+  <WebUI/>
+  <Config Name="Backup folder" Target="/backup" Default="/mnt/user/backup" Mode="rw" Description="Where the copy of the main server is stored." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/backup</Config>
+  <Config Name="Config" Target="/config" Default="/mnt/user/appdata/lsyncd-webui-backup" Mode="rw" Description="Host key of this backup server." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/lsyncd-webui-backup</Config>
+  <Config Name="Main server key" Target="AUTHORIZED_KEY" Default="" Mode="" Description="Public key from the main server's web UI (Settings, SSH key). Starts with ssh-ed25519." Type="Variable" Display="always" Required="false" Mask="false"></Config>
+  <Config Name="SSH port" Target="SSH_PORT" Default="2222" Mode="" Description="Port the main server connects to (host network)." Type="Variable" Display="always" Required="true" Mask="false">2222</Config>
+  <Config Name="Role" Target="ROLE" Default="backup" Mode="" Description="Leave at backup." Type="Variable" Display="advanced" Required="true" Mask="false">backup</Config>
+</Container>

@@ -1,0 +1,3 @@
+#!/bin/sh
+# lsyncd and rsync call plain "ssh"; this makes them use lsyncd-webui's SSH settings.
+exec "${LSYNCD_WEBUI_REAL_SSH:-/usr/bin/ssh}" -F "${LSYNCD_WEBUI_SSH_CONFIG:-/config/ssh/config}" "$@"

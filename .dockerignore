@@ -1,0 +1,7 @@
+.git
+.github
+tests
+compose
+unraid
+*.md
+**/__pycache__

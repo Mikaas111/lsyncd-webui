@@ -1,0 +1,15 @@
+# Backup server: SSH receiver for the mirror. Paste the key from the main server's web UI.
+services:
+  lsyncd-webui-backup:
+    image: ghcr.io/mikaas111/lsyncd-webui:latest
+    container_name: lsyncd-webui-backup
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      ROLE: backup
+      SSH_PORT: "2222"
+      AUTHORIZED_KEY: "ssh-ed25519 AAAA...paste the key from the main server's web UI..."
+      TZ: Europe/Amsterdam
+    volumes:
+      - /mnt/user/backup:/backup
+      - /mnt/user/appdata/lsyncd-webui-backup:/config
