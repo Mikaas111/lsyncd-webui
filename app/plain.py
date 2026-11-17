@@ -31,10 +31,13 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 NAMESPACE = "lsyncd-webui"
 CHUNK = 256 * 1024
 MAX_FRAME = 1 << 20
+# Once a command has ended, its last output and exit code get this long to reach the main server
+FLUSH_TIMEOUT = 60
 HEADER = struct.Struct(">cI")
 # ssh options that take a value, so the parser can find where the command starts
 WITH_VALUE = set("BbcDEeFIiJLlmOoPpQRSWw")
@@ -46,6 +49,23 @@ class PlainError(Exception):
 
 def send_frame(sock, kind, data=b""):
     sock.sendall(HEADER.pack(kind, len(data)) + data)
+
+
+def send_frame_waiting(sock, kind, data, give_up):
+    """Send a frame, waiting for room as long as give_up() says to keep trying.
+
+    Does not rely on the socket being blocking: the command on the backup reads straight from
+    this connection, and rsync makes its input non-blocking, which changes it for us as well.
+    Without this, a main server that reads slowly for a moment looked like a lost connection.
+    """
+    view = memoryview(HEADER.pack(kind, len(data)) + data)
+    while view:
+        try:
+            view = view[sock.send(view, socket.MSG_DONTWAIT):]
+        except BlockingIOError:
+            if give_up():
+                raise TimeoutError("the main server stopped reading")
+            select.select([], [sock], [], 1)
 
 
 def recv_exact(sock, size):
@@ -171,17 +191,24 @@ class Server:
                 conn.settimeout(None)
                 keep_alive(conn)
                 send_frame(conn, b"K")
-                self.run(conn, command)
+                self.run(conn, command, peer)
             except (OSError, EOFError, ValueError, PlainError):
                 pass
 
-    def run(self, conn, command):
+    def run(self, conn, command, peer=""):
         # The command reads its input straight from the connection
         proc = subprocess.Popen(["/bin/sh", "-c", command], stdin=conn.fileno(), stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, bufsize=0, cwd=self.home, env=self.env,
                                 start_new_session=True)
         lock = threading.Lock()
         lost = threading.Event()
+        ended = []  # when the command ended
+        errors = bytearray()  # the end of what it wrote to stderr, for the log
+
+        def give_up():
+            # While the command runs, a main server that reads slowly only means waiting, as with
+            # ssh. Once the command has ended, its last output gets FLUSH_TIMEOUT to get through.
+            return lost.is_set() or (bool(ended) and time.monotonic() - ended[0] > FLUSH_TIMEOUT)
 
         def stop_command():
             lost.set()
@@ -196,12 +223,14 @@ class Server:
                 data = os.read(fd, CHUNK)
                 if not data:
                     break
+                if kind == b"R":
+                    errors[:] = (bytes(errors) + data)[-2000:]
                 if lost.is_set():
                     continue  # keep draining so the command is not stuck on a full pipe
                 try:
                     with lock:
-                        send_frame(conn, kind, data)
-                except OSError:
+                        send_frame_waiting(conn, kind, data, give_up)
+                except OSError:  # the connection is gone, or the main server stopped reading after the end
                     stop_command()
             stream.close()
 
@@ -209,16 +238,25 @@ class Server:
                  threading.Thread(target=pump, args=(proc.stderr, b"R"), daemon=True)]
         for thread in pumps:
             thread.start()
-        for thread in pumps:
-            thread.join()
         code = proc.wait()
+        ended.append(time.monotonic())
+        for thread in pumps:
+            thread.join(FLUSH_TIMEOUT + 5)
+        code = code if code >= 0 else 128 - code
+        if code != 0:
+            last = errors.decode("utf-8", "replace").strip().splitlines()[-1:]
+            self.log(f"A command from {peer} ended with code {code}: {command[:70]}"
+                     + (f" ({last[0][:200]})" if last else ""))
         if not lost.is_set():
             try:
                 with lock:
-                    send_frame(conn, b"X", struct.pack(">i", code if code >= 0 else 128 - code))
-                conn.shutdown(socket.SHUT_RDWR)
+                    send_frame_waiting(conn, b"X", struct.pack(">i", code), give_up)
             except OSError:
                 pass
+        try:
+            conn.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
 
 
 def serve(port, signers_file, log=print):
@@ -343,8 +381,12 @@ def client(config_file, args):
                     sock.shutdown(socket.SHUT_WR)  # end of input
                     return
                 write_all(out, data)
-        except OSError:
-            pass
+        except OSError as err:
+            # The connection broke. Give the reading side a moment to pick up the backup's exit
+            # code and last messages, then end, so rsync notices instead of waiting for ever.
+            time.sleep(5)
+            sys.stderr.write(f"lsyncd-webui: the connection to the backup server was lost ({err}).\n")
+            os._exit(255)
 
     threading.Thread(target=forward_input, daemon=True).start()
     try:

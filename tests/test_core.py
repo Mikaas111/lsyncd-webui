@@ -546,6 +546,70 @@ class PlainTransportTest(unittest.TestCase):
         self.assertEqual(self.client("backup-target", "exit 24").returncode, 24)
         self.assertEqual(self.client("backup-target", "head -c 5000000 /dev/zero").stdout, bytes(5_000_000))
 
+    def test_a_slow_reader_does_not_get_the_command_stopped(self):
+        # rsync on the backup makes its input non-blocking. Its input is the connection itself,
+        # so the backup side's own writes to that connection then fail with "try again" when
+        # the main server reads slowly. That must mean wait, not "connection lost, stop rsync".
+        command = ("python3 -c 'import os, sys; os.set_blocking(0, False); "
+                   "sys.stdout.buffer.write(bytes(30_000_000))'")
+        sock = plain.connect("127.0.0.1", self.server.port, self.key, command)
+        received, code = 0, None
+        with sock:
+            time.sleep(2)  # the main server is busy and does not read for a moment
+            sock.settimeout(20)
+            try:
+                while code is None:
+                    kind, data = plain.recv_frame(sock)
+                    if kind == b"O":
+                        received += len(data)
+                    elif kind == b"X":
+                        code = plain.struct.unpack(">i", data)[0]
+            except (EOFError, OSError):
+                pass
+        self.assertEqual((received, code), (30_000_000, 0))
+
+    def test_sending_waits_and_gives_up_only_when_told(self):
+        a, b = socket.socketpair()
+        with a, b:
+            a.setblocking(False)  # as rsync leaves the shared connection
+            calls = []
+
+            def give_up():
+                calls.append(1)
+                return len(calls) > 2  # nobody reads b; keep waiting twice, then give up
+
+            with self.assertRaises(TimeoutError):
+                plain.send_frame_waiting(a, b"O", bytes(20_000_000), give_up)
+            self.assertEqual(len(calls), 3)
+
+    def test_client_ends_when_the_connection_breaks(self):
+        # A backup side that logs in, takes some input and then drops the connection hard
+        server = socket.create_server(("127.0.0.1", 0))
+        port = server.getsockname()[1]
+
+        def backup():
+            conn, _ = server.accept()
+            plain.send_frame(conn, b"H", b"nonce")
+            plain.recv_frame(conn)
+            plain.send_frame(conn, b"K")
+            conn.recv(100_000)
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, plain.struct.pack("ii", 1, 0))
+            conn.close()  # reset, no exit code
+            server.close()
+
+        threading.Thread(target=backup, daemon=True).start()
+        conf = os.path.join(self.dir, "drop.json")
+        with open(conf, "w") as f:
+            f.write('{"host": "127.0.0.1", "port": %d, "key": "%s"}' % (port, self.key))
+        with open("/dev/zero", "rb") as endless:
+            start = time.monotonic()
+            result = subprocess.run([sys.executable, os.path.join(APP_DIR, "plain.py"), "client", conf,
+                                     "backup-target", "cat > /dev/null"], stdin=endless,
+                                    capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 255)
+        self.assertLess(time.monotonic() - start, 15)
+        self.assertIn(b"connection to the backup server was lost", result.stderr)
+
     def test_non_blocking_pipes_like_rsync_hands_out(self):
         # A slow reader on a non-blocking stdout, and input that arrives in pieces on a non-blocking stdin
         out_r, out_w = os.pipe()
