@@ -174,6 +174,17 @@ class StallTest(unittest.TestCase):
         server.CONSOLE.get_nowait()
 
 
+class HealthcheckTest(unittest.TestCase):
+    def test_backup_health_is_read_without_connecting(self):
+        script = os.path.join(APP_DIR, "healthcheck.py")
+        with socket.create_server(("127.0.0.1", 0)) as listener:
+            port = listener.getsockname()[1]
+            env = {**os.environ, "ROLE": "backup", "SSH_PORT": str(port)}
+            self.assertEqual(subprocess.run([sys.executable, script], env=env).returncode, 0)
+        env = {**os.environ, "ROLE": "backup", "SSH_PORT": "1"}
+        self.assertEqual(subprocess.run([sys.executable, script], env=env).returncode, 1)
+
+
 class BackupLoadTest(unittest.TestCase):
     def test_whole_files_can_be_switched_off(self):
         on, _ = server.validate({"host": "10.0.0.2", "folders": ["Photos"], "twoway": ["Photos"]})
@@ -181,7 +192,7 @@ class BackupLoadTest(unittest.TestCase):
         self.assertIn("--whole-file", server.rsync_base(on))
         self.assertNotIn("--whole-file", server.rsync_base(off))
         self.assertNotIn("--whole-file", server.build_lsyncd_conf(off, ["Photos"]))
-        self.assertNotIn("-rsync", server.build_unison_cmd(off, ["Photos"]))
+        self.assertNotIn("-rsync=false", server.build_unison_cmd(off, ["Photos"]))
 
     def test_unison_pauses_and_continues(self):
         def state(pid):
@@ -343,7 +354,8 @@ class TwoWayTest(unittest.TestCase):
             self.assertIn(flag, cmd)
         self.assertEqual(cmd[cmd.index("-repeat") + 1], "watch+86400")
         self.assertEqual(cmd[cmd.index("-maxthreads") + 1], "1")
-        self.assertEqual(cmd[cmd.index("-rsync") + 1], "false")
+        self.assertIn("-rsync=false", cmd)
+        self.assertNotIn("false", cmd)  # never a loose argument, Unison would take it for a root
         self.assertEqual(cmd[cmd.index("-prefer") + 1], "newer")
         self.assertEqual(cmd[cmd.index("-sshcmd") + 1], server.SSH_WRAPPER)
         ignores = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "-ignore"]
@@ -519,12 +531,12 @@ class PlainTransportTest(unittest.TestCase):
         for args, command in cases:
             self.assertEqual(plain.command_from_ssh_args(args), command, args)
 
-    def test_dead_connections_are_noticed(self):
+    def test_a_busy_reader_is_not_a_dead_connection(self):
         sock = plain.connect("127.0.0.1", self.server.port, self.key, "true")
         with sock:
-            if hasattr(socket, "TCP_USER_TIMEOUT"):
-                self.assertEqual(sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT), 120_000)
             self.assertEqual(sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE), 1)
+            if hasattr(socket, "TCP_USER_TIMEOUT"):  # would end a connection whose reader is busy scanning
+                self.assertEqual(sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT), 0)
 
     def test_output_errors_and_exit_code_come_back(self):
         code, out, err = plain.call("127.0.0.1", self.server.port, self.key, "echo connected; echo oops >&2; exit 3")

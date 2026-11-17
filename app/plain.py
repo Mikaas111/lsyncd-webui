@@ -110,11 +110,14 @@ def challenge_message(nonce, command):
 
 
 def keep_alive(sock):
-    """Notice a dead connection within about 2 minutes, also in the middle of a file."""
+    """Notice an idle connection whose other end is gone.
+
+    No TCP_USER_TIMEOUT: it also ends a connection whose reader is merely busy for a while
+    (rsync scanning a big folder reads nothing for minutes), which broke healthy transfers.
+    A stuck transfer is ended by the task's own guard instead.
+    """
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    # Keepalive probes cover an idle connection; the user timeout covers data that is never acknowledged
-    for name, value in (("TCP_KEEPIDLE", 60), ("TCP_KEEPINTVL", 15), ("TCP_KEEPCNT", 4),
-                        ("TCP_USER_TIMEOUT", 120_000)):
+    for name, value in (("TCP_KEEPIDLE", 60), ("TCP_KEEPINTVL", 15), ("TCP_KEEPCNT", 4)):
         if hasattr(socket, name):
             sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, name), value)
 

@@ -631,7 +631,7 @@ def build_unison_cmd(s, folders):
         "-servercmd", "unison",
     ]
     if s["whole_file"]:
-        cmd += ["-rsync", "false"]
+        cmd.append("-rsync=false")  # a yes/no option: "-rsync false" would make "false" a third root
     for pattern in unison_ignores(s["excludes"], folders):
         cmd += ["-ignore", pattern]
     return cmd
