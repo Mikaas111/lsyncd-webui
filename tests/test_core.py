@@ -147,6 +147,26 @@ class StallTest(unittest.TestCase):
         left = subprocess.run(["pgrep", "-f", silent], capture_output=True, text=True).stdout.strip()
         self.assertEqual(left, "")  # the connection command was ended too
 
+    def test_a_transfer_whose_backup_side_is_gone_is_ended_at_once(self):
+        silent = os.path.join(TMP.name, "silent-rsh-2")
+        with open(silent, "w") as f:
+            f.write("#!/bin/sh\nsleep 60\n")
+        os.chmod(silent, 0o755)
+        jobs = server.Jobs()
+        jobs.progress = server.new_progress()
+        old = server.CHECK_BACKUP_AFTER, server.backup_rsyncs
+        server.CHECK_BACKUP_AFTER, server.backup_rsyncs = 1, lambda: []  # no rsync left on the backup
+        try:
+            start = time.monotonic()
+            code = jobs._run_rsync(["rsync", "-a", "-e", silent, server.DATA_DIR + "/Photos/", "host:/x/"],
+                                   lambda line: None, guard=True)
+        finally:
+            server.CHECK_BACKUP_AFTER, server.backup_rsyncs = old
+        self.assertEqual(code, 30)
+        self.assertLess(time.monotonic() - start, 10)  # not the 7 minutes of the general guard
+        self.assertEqual(jobs.progress["backup"], "No rsync is running on the backup server.")
+        self.assertTrue(any("rsync on the backup server has stopped" in e["text"] for e in server.LOG))
+
     def test_logging_does_not_wait_for_the_console(self):
         before = server.CONSOLE.qsize()
         server.log("test", "goes to a queue, not straight to stdout")

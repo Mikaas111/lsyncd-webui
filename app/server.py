@@ -117,6 +117,9 @@ RETRY_DELAY = 10
 # After its timeout rsync still waits for its connection command (ssh, or plain.py) to end. If that
 # hangs too, the task ends the whole transfer itself once nothing has moved for this much longer.
 GUARD_GRACE = 120
+# After this long without progress while rsync waits for the backup server, look on the backup
+# server (again once a minute). With no rsync left there, the transfer cannot finish: end it at once.
+CHECK_BACKUP_AFTER = 60
 PROGRESS_RE = re.compile(
     r"^\s*([\d.,]+)B?\s+(\d+)%\s+(\S+)\s+(\d+:\d\d:\d\d)"
     r"(?:\s+\((?:xfr#\d+,\s*)?(?:ir|to)-chk=(\d+)/(\d+)\))?"
@@ -796,15 +799,24 @@ print(json.dumps(out))
 """
 
 
-def backup_state(s):
-    """What rsync on the backup server is doing, as a sentence ('' if that cannot be told)."""
+def backup_rsyncs():
+    """The rsync processes on the backup server, as BACKUP_PROBE lists them.
+    'timeout' when the backup server does not answer, None when the list could not be read."""
     try:
         result = ssh("python3 -c " + shlex.quote(BACKUP_PROBE), timeout=20)
     except subprocess.TimeoutExpired:
-        return "The backup server does not answer a separate quick check within 20 seconds either: it is overloaded."
+        return "timeout"
     try:
-        found = json.loads(result.stdout.strip().splitlines()[-1])
+        return json.loads(result.stdout.strip().splitlines()[-1])
     except (ValueError, IndexError):
+        return None
+
+
+def backup_state(s, found):
+    """What rsync on the backup server is doing, as a sentence ('' if that cannot be told)."""
+    if found == "timeout":
+        return "The backup server does not answer a separate quick check within 20 seconds either: it is overloaded."
+    if found is None:
         return ""
     return describe_backup(found, s["target"])
 
@@ -1098,28 +1110,9 @@ class Jobs:
             proc = self.proc
             if proc is not None and proc.poll() is None:
                 info.update(rsync_activity(proc.pid))
-            if info["quiet"] >= 60 and info.get("waiting") == "the backup server":
-                self._check_backup(p)
             if p.get("backup"):
                 info["backup"] = p["backup"]
         return info
-
-    @staticmethod
-    def _check_backup(p):
-        """Once a minute during a stall, ask the backup server what its rsync waits for."""
-        now = time.monotonic()
-        if p.get("checking") or now - p.get("checked_backup", 0) < 60:
-            return
-        p["checking"] = True
-
-        def check():
-            try:
-                p["backup"] = backup_state(load_settings())
-            finally:
-                p["checked_backup"] = time.monotonic()
-                p["checking"] = False
-
-        threading.Thread(target=check, daemon=True).start()
 
     def set(self, **changes):
         with self.lock:
@@ -1193,7 +1186,7 @@ class Jobs:
         last = [time.monotonic()]
         ended = []
         if guard:
-            threading.Thread(target=self._guard, args=(proc, last, ended), daemon=True).start()
+            threading.Thread(target=self._guard, args=(proc, last, ended, self.progress), daemon=True).start()
         buffer = b""
         while True:
             chunk = proc.stdout.read1(65536)
@@ -1215,15 +1208,29 @@ class Jobs:
         return 30 if ended else proc.returncode
 
     @staticmethod
-    def _guard(proc, last, ended):
+    def _guard(proc, last, ended, p):
+        """End a transfer that cannot go on: when rsync on the backup server is gone, or nothing moved for long."""
         limit = RSYNC_TIMEOUT + GUARD_GRACE
+        checked = 0.0
         while proc.poll() is None:
             time.sleep(1)
-            if time.monotonic() - last[0] > limit:
+            quiet = time.monotonic() - last[0]
+            if quiet > limit:
                 ended.append(True)
                 log("rsync", f"Nothing moved for {limit // 60} minutes; ending this transfer so it can start again.")
                 end_group(proc)
                 return
+            if (quiet >= CHECK_BACKUP_AFTER and time.monotonic() - checked >= CHECK_BACKUP_AFTER
+                    and rsync_activity(proc.pid).get("waiting") == "the backup server"):
+                checked = time.monotonic()
+                found = backup_rsyncs()
+                p["backup"] = backup_state(load_settings(), found)
+                if found == [] and proc.poll() is None and time.monotonic() - last[0] >= CHECK_BACKUP_AFTER:
+                    ended.append(True)
+                    log("rsync", "rsync on the backup server has stopped, but this server was still waiting for it. "
+                                 "Ending this transfer so it can start again.")
+                    end_group(proc)
+                    return
 
     @staticmethod
     def _drain_stderr(proc):
