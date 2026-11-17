@@ -364,6 +364,10 @@ function ago(ts) {
   if (s < 86400) return Math.round(s / 3600) + " h ago";
   return new Date(ts * 1000).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 }
+function timeLeft(eta) {
+  const [h, m] = eta.split(":").map(Number);
+  return h ? `about ${h} h ${m} min` : m ? `about ${m} min` : "under a minute";
+}
 const dur = s => (s < 90 ? `${s} s` : s < 5400 ? `${Math.round(s / 60)} min` : `${(s / 3600).toFixed(1)} h`);
 const mbs = b => (b / 1e6).toFixed(b >= 100e6 ? 0 : 1) + " MB/s";
 const mbit = b => Math.round(b * 8 / 1e6) + " Mbit/s";
@@ -532,11 +536,14 @@ function renderJob(st) {
         }
         if (job.bytes) bits.push(`${bytes(job.bytes)} sent`);
         if (job.bytes && job.speed) bits.push(esc(job.speed));
+        if (job.eta && job.eta !== "0:00:00") bits.push(timeLeft(job.eta) + " left in this folder");
+        if (job.attempt > 1) bits.push(`<span style="color:var(--warn)">attempt ${job.attempt} of ${job.attempts}, the previous one stalled</span>`);
         // Where rsync is, and what it waits for when it goes quiet, so a stall can be traced
         const quiet = job.quiet >= 30;
         const where = [];
         if (job.now_at) where.push(`Now at <span class="mono">${esc(job.now_at)}</span>`);
         if (quiet) where.push(`no progress for ${dur(job.quiet)}` + (job.waiting ? `, rsync is waiting for ${esc(job.waiting)}` : ""));
+        if (quiet && job.backup) where.push(esc(job.backup));
         if (where.length) bits.push(`<span${job.quiet >= 120 ? ' style="color:var(--warn)"' : ""}>${where.join(", ")}</span>`);
       } else {
         if (job.phase) bits.push(esc(job.phase));

@@ -1,5 +1,7 @@
 import importlib
+import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -44,6 +46,25 @@ class ProgressTest(unittest.TestCase):
         self.assertEqual(m.group(2), "3")
         self.assertIsNone(m.group(5))
 
+    def test_lines_from_a_real_server(self):
+        # rsync 3.4 on Alpine: thousands separators everywhere and a B after byte counts
+        m = server.PROGRESS_RE.match("   1,811,614,517B   0%   28.3MB/s    0:01:04 (xfr#752, to-chk=1627903/1631351)")
+        self.assertEqual((server.plain_int(m.group(1)), m.group(3), m.group(5)), (1811614517, "28.3MB/s", "1627903"))
+        m = server.PROGRESS_RE.match("   1,823,262,024B   0%   12.4MB/s   22:04:30")
+        self.assertEqual((m.group(4), m.group(5)), ("22:04:30", None))
+        self.assertEqual(server.plain_int(server.SCAN_RE.match(" 64,400 files...").group(1)), 64400)
+        self.assertEqual(server.plain_int(server.CONSIDER_RE.match("83,052 files to consider").group(1)), 83052)
+
+    def test_time_left_comes_from_lines_in_the_middle_of_a_file(self):
+        jobs = server.Jobs()
+        jobs.info = {"folder": "Mika", "state": "running", "kind": "full", "phase": ""}
+        jobs.progress = server.new_progress()
+        jobs._on_progress("1,631,351 files to consider")
+        jobs._on_progress("   1,823,262,024B   0%   12.4MB/s   22:04:30")
+        jobs._on_progress("   1,886,052,663B   0%   27.6MB/s    0:01:08 (xfr#781, to-chk=1627852/1631351)")
+        info = jobs.snapshot()
+        self.assertEqual((info["items"], info["bytes"], info["eta"]), (1631351, 1886052663, "22:04:30"))
+
     def test_other_output_is_not_progress(self):
         self.assertIsNone(server.PROGRESS_RE.match("rsync: connection unexpectedly closed"))
 
@@ -73,13 +94,64 @@ class LsyncdConfigTest(unittest.TestCase):
         self.assertEqual(conf.count("sync {"), 2)
         self.assertIn('targetdir = "/backup/has \\"quote\\"/"', conf)
         self.assertIn('"odd\\"name"', conf)
-        self.assertIn('_extra = { "--out-format=@lsw@0 %i %l %b %n", "--whole-file", "--bwlimit=500" }', conf)
+        self.assertIn('_extra = { "--out-format=@lsw@0 %i %l %b %n", "--timeout=300", "--whole-file", "--bwlimit=500" }', conf)
         self.assertIn("maxProcesses = 1,", conf)  # one transfer at a time to the backup
         self.assertIn('"--out-format=@lsw@1 %i %l %b %n"', conf)
         self.assertIn("delete = true", conf)
         self.assertIn("init = false", conf)
         self.assertIn(f'ssh = {{ binary = "{server.SSH_WRAPPER}" }}', conf)
         self.assertEqual(conf.count("{"), conf.count("}"))
+
+
+class StallTest(unittest.TestCase):
+    def test_a_stalled_folder_is_tried_again(self):
+        jobs = server.Jobs()
+        jobs.info = {"folder": "", "state": "running", "kind": "full", "phase": ""}
+        codes = [30, 0]
+        calls = []
+
+        def fake_rsync(cmd, on_line, guard=False):
+            calls.append((cmd, guard))
+            return codes.pop(0)
+
+        jobs._run_rsync = fake_rsync
+        old = server.RETRY_DELAY, server.ensure_remote_dirs
+        server.RETRY_DELAY, server.ensure_remote_dirs = 0, lambda s, folders: True
+        try:
+            s, _ = server.validate({"host": "10.0.0.2", "folders": ["Documents"]})
+            ok, message = jobs._full(s, ["Documents"])
+        finally:
+            server.RETRY_DELAY, server.ensure_remote_dirs = old
+        self.assertTrue(ok, message)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(guard for _, guard in calls))
+        self.assertIn("--timeout=300", calls[0][0])
+        self.assertTrue(any("Trying again, attempt 2 of 3" in e["text"] for e in server.LOG))
+
+    def test_a_stuck_transfer_is_ended(self):
+        silent = os.path.join(TMP.name, "silent-rsh")
+        with open(silent, "w") as f:
+            f.write("#!/bin/sh\nsleep 60\n")  # a connection command that never answers
+        os.chmod(silent, 0o755)
+        jobs = server.Jobs()
+        old = server.RSYNC_TIMEOUT, server.GUARD_GRACE
+        server.RSYNC_TIMEOUT, server.GUARD_GRACE = 1, 1
+        try:
+            start = time.monotonic()
+            code = jobs._run_rsync(["rsync", "-a", "-e", silent, server.DATA_DIR + "/Photos/", "host:/x/"],
+                                   lambda line: None, guard=True)
+        finally:
+            server.RSYNC_TIMEOUT, server.GUARD_GRACE = old
+        self.assertEqual(code, 30)
+        self.assertLess(time.monotonic() - start, 15)
+        left = subprocess.run(["pgrep", "-f", silent], capture_output=True, text=True).stdout.strip()
+        self.assertEqual(left, "")  # the connection command was ended too
+
+    def test_logging_does_not_wait_for_the_console(self):
+        before = server.CONSOLE.qsize()
+        server.log("test", "goes to a queue, not straight to stdout")
+        self.assertEqual(server.CONSOLE.qsize(), before + 1)
+        server.CONSOLE.get_nowait()
 
 
 class BackupLoadTest(unittest.TestCase):
@@ -169,6 +241,33 @@ class FullSyncProgressTest(unittest.TestCase):
         self.assertEqual(server.waiting_on("folio_wait_bit_common"), "the disk or file system")
         self.assertEqual(server.waiting_on("0"), "")
         self.assertEqual(server.waiting_on("hrtimer_nanosleep"), "")
+
+    def test_what_the_backup_waits_for(self):
+        describe = server.describe_backup
+        found = [{"wchan": "do_select", "file": ""},
+                 {"wchan": "balance_dirty_pages", "file": "/backup/Mika/School/.raspios.img.Xy12"}]
+        self.assertEqual(describe(found, "/backup"),
+                         "On the backup server, rsync waits for its disk (Mika/School/.raspios.img.Xy12).")
+        self.assertIn("connection between them is stuck", describe([{"wchan": "do_select", "file": ""}] * 2, "/backup"))
+        self.assertIn("busy", describe([{"wchan": "0", "file": ""}], "/backup"))
+        self.assertEqual(describe([], "/backup"), "No rsync is running on the backup server.")
+
+    def test_backup_probe_finds_rsync(self):
+        fake = os.path.join(TMP.name, "probe", "rsync")
+        os.makedirs(os.path.dirname(fake), exist_ok=True)
+        with open(fake, "w") as f:
+            f.write(f"#!{sys.executable}\nimport sys, time\nf = open(sys.argv[1], 'w')\ntime.sleep(5)\n")
+        os.chmod(fake, 0o755)
+        target = os.path.join(TMP.name, "probe", "big.img.part")
+        proc = subprocess.Popen([fake, target])
+        try:
+            time.sleep(0.3)
+            out = subprocess.run([sys.executable, "-c", server.BACKUP_PROBE], capture_output=True, text=True)
+            found = [r for r in json.loads(out.stdout) if r["file"] == target]
+            self.assertEqual(len(found), 1)
+        finally:
+            proc.kill()
+            proc.wait()
 
     def test_where_rsync_is(self):
         folder = os.path.join(server.DATA_DIR, "Documents", "2024")
@@ -399,6 +498,13 @@ class PlainTransportTest(unittest.TestCase):
         ]
         for args, command in cases:
             self.assertEqual(plain.command_from_ssh_args(args), command, args)
+
+    def test_dead_connections_are_noticed(self):
+        sock = plain.connect("127.0.0.1", self.server.port, self.key, "true")
+        with sock:
+            if hasattr(socket, "TCP_USER_TIMEOUT"):
+                self.assertEqual(sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT), 120_000)
+            self.assertEqual(sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE), 1)
 
     def test_output_errors_and_exit_code_come_back(self):
         code, out, err = plain.call("127.0.0.1", self.server.port, self.key, "echo connected; echo oops >&2; exit 3")

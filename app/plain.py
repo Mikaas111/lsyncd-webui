@@ -90,8 +90,11 @@ def challenge_message(nonce, command):
 
 
 def keep_alive(sock):
+    """Notice a dead connection within about 2 minutes, also in the middle of a file."""
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    for name, value in (("TCP_KEEPIDLE", 60), ("TCP_KEEPINTVL", 15), ("TCP_KEEPCNT", 4)):
+    # Keepalive probes cover an idle connection; the user timeout covers data that is never acknowledged
+    for name, value in (("TCP_KEEPIDLE", 60), ("TCP_KEEPINTVL", 15), ("TCP_KEEPCNT", 4),
+                        ("TCP_USER_TIMEOUT", 120_000)):
         if hasattr(socket, name):
             sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, name), value)
 

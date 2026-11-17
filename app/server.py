@@ -15,6 +15,7 @@ import hmac
 import json
 import os
 import posixpath
+import queue
 import re
 import shlex
 import signal
@@ -102,12 +103,29 @@ OUT_FORMAT = "--out-format=@lsw@{} %i %l %b %n"
 FILE_RE = re.compile(r"^@lsw@(\d*) (\S)(\S)\S*\s+(\d+) \d+ (.*)$")
 UNISON_BGN_RE = re.compile(r"^\[BGN\] (?:Copying|Updating file) (.+) from (\S+) to (\S+)$")
 UNISON_END_RE = re.compile(r"^\[END\] (?:Copying|Updating file) (.+)$")
-SCAN_RE = re.compile(r"^\s*(\d+) files\.\.\.$")
-CONSIDER_RE = re.compile(r"^(\d+) files to consider$")
+# rsync writes numbers with thousands separators ("1,000 files..."), depending on its version and
+# locale, and newer versions put a B after byte counts ("1,811,614,517B")
+SCAN_RE = re.compile(r"^\s*([\d.,]+) files\.\.\.$")
+CONSIDER_RE = re.compile(r"^\s*([\d.,]+) files to consider$")
+# rsync exits when nothing moves for this long; the folder is then tried again
+RSYNC_TIMEOUT = 300
+STALL_ATTEMPTS = 3
+# Exit codes after which another attempt can help: 10/12 connection or protocol trouble,
+# 30/35 timeout, 255 the connection command failed
+RETRY_CODES = (10, 12, 30, 35, 255)
+RETRY_DELAY = 10
+# After its timeout rsync still waits for its connection command (ssh, or plain.py) to end. If that
+# hangs too, the task ends the whole transfer itself once nothing has moved for this much longer.
+GUARD_GRACE = 120
 PROGRESS_RE = re.compile(
-    r"^\s*([\d.,]+)\s+(\d+)%\s+(\S+)\s+(\d+:\d\d:\d\d)"
+    r"^\s*([\d.,]+)B?\s+(\d+)%\s+(\S+)\s+(\d+:\d\d:\d\d)"
     r"(?:\s+\((?:xfr#\d+,\s*)?(?:ir|to)-chk=(\d+)/(\d+)\))?"
 )
+
+
+def plain_int(text):
+    """'1,811,614,517' or '1.811.614.517' -> 1811614517"""
+    return int(re.sub(r"\D", "", text) or 0)
 
 # ---------------------------------------------------------------------------
 # Log
@@ -116,6 +134,9 @@ PROGRESS_RE = re.compile(
 LOG = collections.deque(maxlen=1000)
 LOG_LOCK = threading.Lock()
 _log_seq = 0
+# Lines for the container log. A thread of its own writes them, so a slow Docker log never holds
+# up the code that reads rsync's output (and with it rsync); when it falls far behind, lines are dropped.
+CONSOLE = queue.Queue(maxsize=10000)
 
 
 def log(source, message):
@@ -127,7 +148,15 @@ def log(source, message):
     with LOG_LOCK:
         _log_seq += 1
         LOG.append({"seq": _log_seq, "time": stamp, "source": source, "text": text})
-    print(f"{stamp} [{source}] {text}", flush=True)
+    try:
+        CONSOLE.put_nowait(f"{stamp} [{source}] {text}")
+    except queue.Full:
+        pass
+
+
+def console_writer():
+    while True:
+        print(CONSOLE.get(), flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +464,7 @@ def ensure_remote_dirs(s, folders):
 
 
 def rsync_base(s):
-    cmd = ["rsync", "-a"]
+    cmd = ["rsync", "-a", f"--timeout={RSYNC_TIMEOUT}"]
     if s["whole_file"]:
         cmd.append("--whole-file")  # the backup does not read the old version to work out a difference
     if s["compress"]:
@@ -510,7 +539,7 @@ def build_lsyncd_conf(s, folders):
         "",
     ]
     for index, folder in enumerate(folders):
-        extra = [OUT_FORMAT.format(index)] + (["--whole-file"] if s["whole_file"] else [])
+        extra = [OUT_FORMAT.format(index), f"--timeout={RSYNC_TIMEOUT}"] + (["--whole-file"] if s["whole_file"] else [])
         extra += [f"--bwlimit={s['bwlimit']}"] if s["bwlimit"] else []
         out += [
             "sync {",
@@ -698,9 +727,23 @@ def rsync_file_line(line, folder_for):
     return kind
 
 
+def end_group(proc):
+    """End a process started in a session of its own, with everything it started."""
+    for sig, wait in ((signal.SIGTERM, 10), (signal.SIGKILL, 10)):
+        try:
+            os.killpg(proc.pid, sig)
+        except OSError:
+            return
+        try:
+            proc.wait(wait)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
 def new_progress():
     return {"active": True, "seen": time.monotonic(), "scanned": 0, "items": 0, "checked": 0,
-            "bytes": 0, "sent_percent": 0, "speed": ""}
+            "bytes": 0, "sent_percent": 0, "speed": "", "eta": ""}
 
 
 def sync_progress(p):
@@ -712,18 +755,73 @@ def sync_progress(p):
     return {
         "phase": "Comparing and sending" if items else "Scanning",
         "scanned": p["scanned"], "items": items, "checked": min(p["checked"], items) if items else 0,
-        "bytes": p["bytes"], "speed": p["speed"], "percent": int(fraction * 100),
+        "bytes": p["bytes"], "speed": p["speed"], "eta": p["eta"], "percent": int(fraction * 100),
         "quiet": int(time.monotonic() - p["seen"]),
     }
 
 
-def waiting_on(wchan):
-    """What a sleeping process waits for, from the kernel function it sleeps in."""
+def wait_kind(wchan):
+    """'network', 'disk' or '' (running, or nothing to tell), from the kernel function a process sleeps in."""
     if not wchan or wchan == "0" or "nanosleep" in wchan:
         return ""
     if "select" in wchan or "poll" in wchan:
-        return "the backup server"  # rsync waits for its connection with select()
-    return "the disk or file system"
+        return "network"  # rsync waits for its connection with select()
+    return "disk"
+
+
+def waiting_on(wchan):
+    """What rsync on this server waits for, in words."""
+    return {"network": "the backup server", "disk": "the disk or file system"}.get(wait_kind(wchan), "")
+
+
+# Runs on the backup server during a stall: what its rsync processes wait for and which file they have open
+BACKUP_PROBE = """
+import json, os
+out = []
+for pid in os.listdir("/proc"):
+    try:
+        if not pid.isdigit() or open(f"/proc/{pid}/comm").read().strip() != "rsync":
+            continue
+        paths = []
+        for fd in os.listdir(f"/proc/{pid}/fd"):
+            try:
+                paths.append(os.readlink(f"/proc/{pid}/fd/{fd}"))
+            except OSError:
+                pass
+        paths = [p for p in paths if p.startswith("/") and not p.startswith(("/dev/", "/proc/"))]
+        out.append({"wchan": open(f"/proc/{pid}/wchan").read().strip(), "file": max(paths, key=len) if paths else ""})
+    except OSError:
+        pass
+print(json.dumps(out))
+"""
+
+
+def backup_state(s):
+    """What rsync on the backup server is doing, as a sentence ('' if that cannot be told)."""
+    try:
+        result = ssh("python3 -c " + shlex.quote(BACKUP_PROBE), timeout=20)
+    except subprocess.TimeoutExpired:
+        return "The backup server does not answer a separate quick check within 20 seconds either: it is overloaded."
+    try:
+        found = json.loads(result.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return ""
+    return describe_backup(found, s["target"])
+
+
+def describe_backup(found, target):
+    target = target.rstrip("/") + "/"
+    kinds = [wait_kind(r["wchan"]) for r in found]
+    if "disk" in kinds:
+        where = max((r["file"] for r, k in zip(found, kinds) if k == "disk"), key=len)
+        where = where[len(target):] if where.startswith(target) else where
+        return "On the backup server, rsync waits for its disk" + (f" ({where})" if where else "") + "."
+    if found and all(k == "network" for k in kinds):
+        return ("On the backup server, rsync waits for data from this server: "
+                "the connection between them is stuck, not the disks.")
+    if found:
+        return "On the backup server, rsync is busy working (CPU)."
+    return "No rsync is running on the backup server."
 
 
 def rsync_activity(pid):
@@ -1000,7 +1098,28 @@ class Jobs:
             proc = self.proc
             if proc is not None and proc.poll() is None:
                 info.update(rsync_activity(proc.pid))
+            if info["quiet"] >= 60 and info.get("waiting") == "the backup server":
+                self._check_backup(p)
+            if p.get("backup"):
+                info["backup"] = p["backup"]
         return info
+
+    @staticmethod
+    def _check_backup(p):
+        """Once a minute during a stall, ask the backup server what its rsync waits for."""
+        now = time.monotonic()
+        if p.get("checking") or now - p.get("checked_backup", 0) < 60:
+            return
+        p["checking"] = True
+
+        def check():
+            try:
+                p["backup"] = backup_state(load_settings())
+            finally:
+                p["checked_backup"] = time.monotonic()
+                p["checking"] = False
+
+        threading.Thread(target=check, daemon=True).start()
 
     def set(self, **changes):
         with self.lock:
@@ -1035,7 +1154,7 @@ class Jobs:
         self.stop_requested = True
         proc = self.proc
         if proc is not None and proc.poll() is None:
-            proc.terminate()
+            threading.Thread(target=end_group, args=(proc,), daemon=True).start()
 
     def _run(self, kind, s, folders):
         log("task", f"{JOB_NAMES[kind]} started" + (f" for: {', '.join(folders)}" if folders else "."))
@@ -1059,20 +1178,28 @@ class Jobs:
         self.set(state=state, finished=time.time(), message=message, phase="")
         log("task", f"{JOB_NAMES[kind]}: {message}")
 
-    def _run_rsync(self, cmd, on_line):
+    def _run_rsync(self, cmd, on_line, guard=False):
+        """Run rsync and feed its output lines to on_line. With guard, a transfer that stops
+        moving is ended (and reported as rsync's timeout code, 30), however it is stuck."""
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            # A session of its own, so ending it also ends its connection command (ssh or plain.py)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
         except OSError as err:
             log("rsync", f"Could not start rsync: {err}")
             return -1
         self.proc = proc
         errors = threading.Thread(target=self._drain_stderr, args=(proc,), daemon=True)
         errors.start()
+        last = [time.monotonic()]
+        ended = []
+        if guard:
+            threading.Thread(target=self._guard, args=(proc, last, ended), daemon=True).start()
         buffer = b""
         while True:
             chunk = proc.stdout.read1(65536)
             if not chunk:
                 break
+            last[0] = time.monotonic()
             buffer += chunk
             *lines, buffer = re.split(rb"[\r\n]", buffer)
             for raw in lines:
@@ -1082,8 +1209,21 @@ class Jobs:
             on_line(buffer.decode("utf-8", "replace"))
         proc.wait()
         errors.join(5)
+        for stream in (proc.stdout, proc.stderr):
+            stream.close()
         self.proc = None
-        return proc.returncode
+        return 30 if ended else proc.returncode
+
+    @staticmethod
+    def _guard(proc, last, ended):
+        limit = RSYNC_TIMEOUT + GUARD_GRACE
+        while proc.poll() is None:
+            time.sleep(1)
+            if time.monotonic() - last[0] > limit:
+                ended.append(True)
+                log("rsync", f"Nothing moved for {limit // 60} minutes; ending this transfer so it can start again.")
+                end_group(proc)
+                return
 
     @staticmethod
     def _drain_stderr(proc):
@@ -1105,11 +1245,11 @@ class Jobs:
             return
         match = SCAN_RE.match(line)
         if match:
-            p["scanned"] = int(match.group(1))
+            p["scanned"] = plain_int(match.group(1))
             return
         match = CONSIDER_RE.match(line)
         if match:
-            p["items"] = int(match.group(1))
+            p["items"] = plain_int(match.group(1))
             return
         if line.strip() == "building file list ...":
             return
@@ -1117,8 +1257,9 @@ class Jobs:
         if not match:
             log("rsync", line)
             return
-        p.update(bytes=int(re.sub(r"\D", "", match.group(1)) or 0), sent_percent=int(match.group(2)),
-                 speed=match.group(3))
+        p.update(bytes=plain_int(match.group(1)), sent_percent=int(match.group(2)), speed=match.group(3))
+        if match.group(5) is None:  # a line in the middle of a file ends in the time left; one after a file, in the time taken
+            p["eta"] = match.group(4)
 
     @staticmethod
     def _expected_items(folder):
@@ -1154,9 +1295,18 @@ class Jobs:
             if s["delete"]:
                 cmd.append("--delete")
             cmd += [src + "/", f"{SSH_ALIAS}:{remote_dir(s, folder)}/"]
-            self.progress = new_progress()
-            code = self._run_rsync(cmd, self._on_progress)
-            self.progress = {}
+            for attempt in range(1, STALL_ATTEMPTS + 1):
+                self.set(attempt=attempt, attempts=STALL_ATTEMPTS)
+                self.progress = new_progress()
+                code = self._run_rsync(cmd, self._on_progress, guard=True)
+                self.progress = {}
+                if code not in RETRY_CODES or self.stop_requested or attempt == STALL_ATTEMPTS:
+                    break
+                # What was copied stays copied; the next attempt continues with the rest
+                log("task", f"{folder}: the transfer stalled or broke off (rsync code {code}). "
+                            f"Trying again, attempt {attempt + 1} of {STALL_ATTEMPTS}.")
+                time.sleep(RETRY_DELAY)
+            self.set(attempt=0)
             if code in (0, 24):  # 24: some files vanished during the transfer
                 self.set(percent=100)
             elif self.stop_requested:
@@ -1617,6 +1767,7 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     threading.Thread(target=lsyncd.watchdog, daemon=True).start()
     threading.Thread(target=unison.watchdog, daemon=True).start()
+    threading.Thread(target=console_writer, daemon=True).start()
     threading.Thread(target=scheduler, daemon=True).start()
     threading.Thread(target=transfer.run, daemon=True).start()
     threading.Thread(target=startup, args=(settings,), daemon=True).start()
