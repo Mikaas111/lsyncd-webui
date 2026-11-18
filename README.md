@@ -28,7 +28,7 @@ Image: `ghcr.io/mikaas111/lsyncd-webui:latest`
 - **Two-way folders.** For folders you choose, changes made on the backup server are copied back to the main server too.
 - **Pick folders in the browser.** Tick shares or subfolders in a folder tree. Shares that are shortcuts to a pool, such as `appdata`, work too.
 - **Excludes.** Skip files like `*.tmp` or whole folders like `cache/`.
-- **Progress.** See how far a full sync is: items found while scanning, items compared, data sent and speed.
+- **Progress.** See how far a full sync is: items compared, data sent, speed and time left.
 - **Scheduled folders.** Folders that change all the time, such as appdata, can be copied every few hours instead of live, so they do not keep sending in between.
 - **Live transfer view.** The current speed and the last file that was copied in full, updated every 2 seconds.
 - **Speed test.** Finds what limits the sync speed (the network, SSH encryption or the backup's disks) and switches to the fastest encryption.
@@ -269,8 +269,8 @@ Then click **Apply**. The container picks the new paths up by itself and your se
 | Something was not mirrored | Files written directly to `/mnt/cache` or `/mnt/diskX` bypass live sync. The nightly full sync picks them up, or click **Full sync now**. |
 | Watched folders close to the limit | See *Large shares* above. |
 | **Changes waiting** is much higher than the rise in **Files copied** | Normal: a change can also be a new folder, a move, a deletion or a file that was already on the backup. **Files copied** only counts files whose contents were sent. |
-| A folder with many files shows 0% for a long time | rsync first scans the folder (**Scanning the main server: … items found**), then compares every item with the backup (**… of … items compared**). Both counts keep moving while it works. |
-| A full sync says **attempt 2 of 3, the previous one stalled** | A transfer stopped moving. After a minute the task looks on the backup server; if no rsync runs there any more, it ends the transfer at once. Otherwise rsync gives up after 5 minutes without data, and the task ends any transfer that has not moved for 7 minutes. Either way it then tries that folder again (up to 3 times). Files that were already copied are not sent again. |
+| A folder shows no percent, only a moving bar | rsync lists a folder bit by bit while it copies, so a big backup server never has to hold millions of items at once. Until the list is complete the card shows **… items compared, … listed so far**; after a **Count files** it shows **… of about …** and a percent. |
+| A full sync says **attempt 2 of 3, the previous one stalled** | A transfer stopped moving. After a minute the task looks on the backup server; if no rsync runs there any more, it ends the transfer at once. Otherwise rsync gives up after 10 minutes without data, and the task ends any transfer that has not moved for 12 minutes. Either way it then tries that folder again (up to 3 times). Files that were already copied are not sent again. |
 | A full sync shows **no progress for …** | The task card shows where rsync is (**Now at …**) and what it waits for. *The disk or file system*: something in that folder answers slowly or not at all, such as a network or cloud mount, or a failing disk. *The backup server*: after a minute the card also says what rsync on the backup server waits for. *Its disk*: the backup's disks cannot keep up; see *Light on the backup server*, and check the disk in the Unraid **Main** tab. *Data from this server*: the connection between the containers is stuck; set **Encryption** back to **SSH** and tell us about it. |
 | Syncing is slower than your internet connection | Run the speed test, see *Sync slower than expected?* above. |
 | Saving **Encryption: None** fails with "No connection to port 2223" | Update the backup container, and check that nothing blocks port 2223 between the servers. |

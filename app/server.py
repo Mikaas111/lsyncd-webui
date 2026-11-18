@@ -108,7 +108,7 @@ UNISON_END_RE = re.compile(r"^\[END\] (?:Copying|Updating file) (.+)$")
 SCAN_RE = re.compile(r"^\s*([\d.,]+) files\.\.\.$")
 CONSIDER_RE = re.compile(r"^\s*([\d.,]+) files to consider$")
 # rsync exits when nothing moves for this long; the folder is then tried again
-RSYNC_TIMEOUT = 300
+RSYNC_TIMEOUT = 600
 STALL_ATTEMPTS = 3
 # Exit codes after which another attempt can help: 10/12 connection or protocol trouble,
 # 30/35 timeout, 255 the connection command failed
@@ -120,9 +120,11 @@ GUARD_GRACE = 120
 # After this long without progress while rsync waits for the backup server, look on the backup
 # server (again once a minute). With no rsync left there, the transfer cannot finish: end it at once.
 CHECK_BACKUP_AFTER = 60
+# Groups: bytes, percent, speed, time, then after a finished file: ir/to, items left, items listed.
+# "ir" means rsync is still listing the folder (the total grows); "to" means the list is complete.
 PROGRESS_RE = re.compile(
     r"^\s*([\d.,]+)B?\s+(\d+)%\s+(\S+)\s+(\d+:\d\d:\d\d)"
-    r"(?:\s+\((?:xfr#\d+,\s*)?(?:ir|to)-chk=(\d+)/(\d+)\))?"
+    r"(?:\s+\((?:xfr#\d+,\s*)?(ir|to)-chk=(\d+)/(\d+)\))?"
 )
 
 
@@ -744,21 +746,36 @@ def end_group(proc):
             continue
 
 
-def new_progress():
-    return {"active": True, "seen": time.monotonic(), "scanned": 0, "items": 0, "checked": 0,
-            "bytes": 0, "sent_percent": 0, "speed": "", "eta": ""}
+def new_progress(expected=0):
+    """Counts for the folder rsync works on. expected: its items at the last count, if any."""
+    return {"active": True, "seen": time.monotonic(), "scanned": 0, "listed": 0, "final": False,
+            "expected": expected, "checked": 0, "bytes": 0, "sent_percent": 0, "speed": "", "eta": ""}
 
 
 def sync_progress(p):
-    """Progress of the folder rsync is on, from the counts _on_progress keeps."""
-    items = p["items"]
-    # Items compared moves when little changed; bytes sent moves during a first upload of big files
-    compared = p["checked"] / items if items else 0.0
-    fraction = min(1.0, max(compared, p["sent_percent"] / 100))
+    """Progress of the folder rsync is on, from the counts _on_progress keeps.
+
+    rsync lists a folder bit by bit while it works, so the number of items is only known
+    at the end; until then the last count gives an estimate, if there is one.
+    """
+    if p["final"] and p["listed"]:
+        items, note = p["listed"], ""
+    elif p["expected"]:
+        items, note = max(p["expected"], p["listed"]), "about"
+    else:
+        items, note = p["listed"], "so far"
+    # Items compared moves when little changed; bytes sent moves during a first upload of big files.
+    # Without any total, a share would only be of what is listed so far, so there is none.
+    if note == "so far":
+        percent = None
+    else:
+        compared = p["checked"] / items if items else 0.0
+        percent = int(min(1.0, max(compared, p["sent_percent"] / 100)) * 100)
+    started = p["checked"] or p["listed"] or p["bytes"]
     return {
-        "phase": "Comparing and sending" if items else "Scanning",
-        "scanned": p["scanned"], "items": items, "checked": min(p["checked"], items) if items else 0,
-        "bytes": p["bytes"], "speed": p["speed"], "eta": p["eta"], "percent": int(fraction * 100),
+        "phase": "Comparing and sending" if started else "Starting",
+        "scanned": p["scanned"], "items": items, "items_note": note, "checked": p["checked"],
+        "bytes": p["bytes"], "speed": p["speed"], "eta": p["eta"], "percent": percent,
         "quiet": int(time.monotonic() - p["seen"]),
     }
 
@@ -777,14 +794,33 @@ def waiting_on(wchan):
     return {"network": "the backup server", "disk": "the disk or file system"}.get(wait_kind(wchan), "")
 
 
-# Runs on the backup server during a stall: what its rsync processes wait for and which file they have open
+# Runs on the backup server during a stall. For 2 seconds it watches each rsync process: the CPU
+# time it uses (as a share of one core), its state and what it waits for, and the deepest file it has open.
 BACKUP_PROBE = """
-import json, os
-out = []
+import json, os, time
+def ticks(pid):
+    fields = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
+    return int(fields[11]) + int(fields[12])
+pids = {}
 for pid in os.listdir("/proc"):
     try:
-        if not pid.isdigit() or open(f"/proc/{pid}/comm").read().strip() != "rsync":
-            continue
+        if pid.isdigit() and open(f"/proc/{pid}/comm").read().strip() == "rsync":
+            pids[pid] = {"start": ticks(pid), "waits": [], "file": ""}
+    except OSError:
+        pass
+began = time.monotonic()
+for _ in range(10):
+    for pid, seen in pids.items():
+        try:
+            state = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[0]
+            seen["waits"].append([state, open(f"/proc/{pid}/wchan").read().strip()])
+        except OSError:
+            pass
+    time.sleep(0.2)
+elapsed = time.monotonic() - began
+out = []
+for pid, seen in pids.items():
+    try:
         paths = []
         for fd in os.listdir(f"/proc/{pid}/fd"):
             try:
@@ -792,7 +828,8 @@ for pid in os.listdir("/proc"):
             except OSError:
                 pass
         paths = [p for p in paths if p.startswith("/") and not p.startswith(("/dev/", "/proc/"))]
-        out.append({"wchan": open(f"/proc/{pid}/wchan").read().strip(), "file": max(paths, key=len) if paths else ""})
+        cpu = (ticks(pid) - seen["start"]) / os.sysconf("SC_CLK_TCK") / elapsed * 100
+        out.append({"cpu": round(cpu), "waits": seen["waits"], "file": max(paths, key=len) if paths else ""})
     except OSError:
         pass
 print(json.dumps(out))
@@ -821,19 +858,31 @@ def backup_state(s, found):
     return describe_backup(found, s["target"])
 
 
+def process_kind(waits):
+    """What a process mostly did over the samples: 'disk', 'network', 'cpu' or ''."""
+    tally = collections.Counter()
+    for state, wchan in waits:
+        tally["cpu" if state == "R" else "disk" if state == "D" else wait_kind(wchan) or "other"] += 1
+    return tally.most_common(1)[0][0] if tally else ""
+
+
 def describe_backup(found, target):
     target = target.rstrip("/") + "/"
-    kinds = [wait_kind(r["wchan"]) for r in found]
+    if not found:
+        return "No rsync is running on the backup server."
+    kinds = [process_kind(r.get("waits", [])) for r in found]
+    busiest = max(r.get("cpu", 0) for r in found)
     if "disk" in kinds:
         where = max((r["file"] for r, k in zip(found, kinds) if k == "disk"), key=len)
         where = where[len(target):] if where.startswith(target) else where
         return "On the backup server, rsync waits for its disk" + (f" ({where})" if where else "") + "."
-    if found and all(k == "network" for k in kinds):
+    if busiest >= 60 or "cpu" in kinds:
+        return (f"On the backup server, rsync is busy computing: it uses {busiest}% of one CPU core. "
+                "rsync can only use one core, so the dashboard's average over all cores shows less.")
+    if all(k == "network" for k in kinds):
         return ("On the backup server, rsync waits for data from this server: "
                 "the connection between them is stuck, not the disks.")
-    if found:
-        return "On the backup server, rsync is busy working (CPU)."
-    return "No rsync is running on the backup server."
+    return f"On the backup server, rsync is working ({busiest}% of one CPU core)."
 
 
 def rsync_activity(pid):
@@ -1256,9 +1305,9 @@ class Jobs:
             return
         match = CONSIDER_RE.match(line)
         if match:
-            p["items"] = plain_int(match.group(1))
+            p.update(listed=plain_int(match.group(1)), final=True)
             return
-        if line.strip() == "building file list ...":
+        if line.strip() in ("building file list ...", "sending incremental file list"):
             return
         match = PROGRESS_RE.match(line)
         if not match:
@@ -1267,6 +1316,9 @@ class Jobs:
         p.update(bytes=plain_int(match.group(1)), sent_percent=int(match.group(2)), speed=match.group(3))
         if match.group(5) is None:  # a line in the middle of a file ends in the time left; one after a file, in the time taken
             p["eta"] = match.group(4)
+        else:
+            p["listed"] = max(p["listed"], int(match.group(7)))
+            p["final"] = p["final"] or match.group(5) == "to"
 
     @staticmethod
     def _expected_items(folder):
@@ -1288,8 +1340,8 @@ class Jobs:
         for index, folder in enumerate(folders, 1):
             if self.stop_requested:
                 break
-            self.set(folder=folder, index=index, expected=self._expected_items(folder), percent=0,
-                     phase="Scanning", scanned=0, items=0, checked=0, bytes=0, speed="")
+            expected = self._expected_items(folder)
+            self.set(folder=folder, index=index, percent=0, phase="Starting", items=0, checked=0, bytes=0, speed="")
             src = source_dir(folder)
             with os.scandir(src) as entries:
                 empty = next(entries, None) is None
@@ -1297,14 +1349,16 @@ class Jobs:
                 log("task", f"{folder} is empty on the main server. Skipped so the backup copy is not wiped by accident.")
                 problems.append(f"{folder} (empty, skipped)")
                 continue
-            # flist2 reports the scan, name2 every item compared, so the progress bar keeps moving
-            cmd = rsync_base(s) + ["--info=progress2,flist2,name2", "--no-inc-recursive", OUT_FORMAT.format("")]
+            # name2 reports every item compared, so the progress keeps moving. The folder is listed bit by
+            # bit (rsync's default), never in full up front: a list of millions of items costs the backup
+            # server minutes of CPU and lots of memory before anything moves.
+            cmd = rsync_base(s) + ["--info=progress2,name2", OUT_FORMAT.format("")]
             if s["delete"]:
                 cmd.append("--delete")
             cmd += [src + "/", f"{SSH_ALIAS}:{remote_dir(s, folder)}/"]
             for attempt in range(1, STALL_ATTEMPTS + 1):
                 self.set(attempt=attempt, attempts=STALL_ATTEMPTS)
-                self.progress = new_progress()
+                self.progress = new_progress(expected)
                 code = self._run_rsync(cmd, self._on_progress, guard=True)
                 self.progress = {}
                 if code not in RETRY_CODES or self.stop_requested or attempt == STALL_ATTEMPTS:

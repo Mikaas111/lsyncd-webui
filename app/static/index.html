@@ -58,6 +58,9 @@ section[hidden] { display: none; }
 .tile .s { color: var(--muted); font-size: 12.5px; }
 .bar { height: 10px; background: var(--code); border-radius: 999px; overflow: hidden; margin: 12px 0 8px; }
 .bar > div { height: 100%; background: var(--brand); border-radius: 999px; transition: width .4s; }
+.bar.unknown > div { width: 30%; animation: unknown 1.6s ease-in-out infinite; }
+@keyframes unknown { from { margin-left: -30%; } to { margin-left: 100%; } }
+@media (prefers-reduced-motion: reduce) { .bar.unknown > div { width: 100%; opacity: .35; animation: none; } }
 .muted { color: var(--muted); }
 .small { font-size: 13px; }
 button.btn { font: inherit; font-size: 14px; padding: 7px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--text); cursor: pointer; }
@@ -524,15 +527,19 @@ function renderJob(st) {
     html += `</div>`;
     if (running) {
       const syncing = (job.kind === "full" || job.kind === "scheduled") &&
-        (job.phase === "Scanning" || job.phase === "Comparing and sending");
-      html += `<div class="bar"><div style="width:${Math.max(2, job.percent)}%"></div></div>`;
+        (job.phase === "Starting" || job.phase === "Comparing and sending");
+      // No percent while the size of the folder is still unknown: then the bar only shows that it works
+      html += job.percent == null ? `<div class="bar unknown"><div></div></div>`
+        : `<div class="bar"><div style="width:${Math.max(2, job.percent)}%"></div></div>`;
       const bits = [];
       if (syncing) {
-        if (job.phase === "Scanning") {
-          bits.push(`Scanning the main server: ${num(job.scanned)} items found` + (job.expected ? ` of about ${num(job.expected)}` : ""));
+        if (job.phase === "Starting") {
+          bits.push("Starting");
         } else {
-          bits.push(`${job.percent}% of this folder`);
-          if (job.items) bits.push(`${num(job.checked)} of ${num(job.items)} items compared`);
+          if (job.percent != null) bits.push(`${job.percent}% of this folder`);
+          // rsync lists a folder while it works: the total is exact at the end, estimated from the last count before that
+          if (job.items_note === "so far") bits.push(`${num(job.checked)} items compared, ${num(job.items)} listed so far`);
+          else if (job.items) bits.push(`${num(job.checked)} of ${job.items_note === "about" ? "about " : ""}${num(job.items)} items compared`);
         }
         if (job.bytes) bits.push(`${bytes(job.bytes)} sent`);
         if (job.bytes && job.speed) bits.push(esc(job.speed));

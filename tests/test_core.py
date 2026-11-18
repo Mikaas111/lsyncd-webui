@@ -39,7 +39,7 @@ class ProgressTest(unittest.TestCase):
         m = server.PROGRESS_RE.match("    1,234,567  45%   12.34MB/s    0:01:23 (xfr#12, to-chk=345/1000)")
         self.assertEqual(m.group(2), "45")
         self.assertEqual(m.group(3), "12.34MB/s")
-        self.assertEqual((m.group(5), m.group(6)), ("345", "1000"))
+        self.assertEqual((m.group(5), m.group(6), m.group(7)), ("to", "345", "1000"))
 
     def test_progress_line_without_counts(self):
         m = server.PROGRESS_RE.match("         32,768   3%    0.00kB/s    0:00:00")
@@ -49,7 +49,8 @@ class ProgressTest(unittest.TestCase):
     def test_lines_from_a_real_server(self):
         # rsync 3.4 on Alpine: thousands separators everywhere and a B after byte counts
         m = server.PROGRESS_RE.match("   1,811,614,517B   0%   28.3MB/s    0:01:04 (xfr#752, to-chk=1627903/1631351)")
-        self.assertEqual((server.plain_int(m.group(1)), m.group(3), m.group(5)), (1811614517, "28.3MB/s", "1627903"))
+        self.assertEqual((server.plain_int(m.group(1)), m.group(3), m.group(5), m.group(6)),
+                         (1811614517, "28.3MB/s", "to", "1627903"))
         m = server.PROGRESS_RE.match("   1,823,262,024B   0%   12.4MB/s   22:04:30")
         self.assertEqual((m.group(4), m.group(5)), ("22:04:30", None))
         self.assertEqual(server.plain_int(server.SCAN_RE.match(" 64,400 files...").group(1)), 64400)
@@ -94,7 +95,7 @@ class LsyncdConfigTest(unittest.TestCase):
         self.assertEqual(conf.count("sync {"), 2)
         self.assertIn('targetdir = "/backup/has \\"quote\\"/"', conf)
         self.assertIn('"odd\\"name"', conf)
-        self.assertIn('_extra = { "--out-format=@lsw@0 %i %l %b %n", "--timeout=300", "--whole-file", "--bwlimit=500" }', conf)
+        self.assertIn('_extra = { "--out-format=@lsw@0 %i %l %b %n", "--timeout=600", "--whole-file", "--bwlimit=500" }', conf)
         self.assertIn("maxProcesses = 1,", conf)  # one transfer at a time to the backup
         self.assertIn('"--out-format=@lsw@1 %i %l %b %n"', conf)
         self.assertIn("delete = true", conf)
@@ -125,7 +126,8 @@ class StallTest(unittest.TestCase):
         self.assertTrue(ok, message)
         self.assertEqual(len(calls), 2)
         self.assertTrue(all(guard for _, guard in calls))
-        self.assertIn("--timeout=300", calls[0][0])
+        self.assertIn("--timeout=600", calls[0][0])
+        self.assertNotIn("--no-inc-recursive", calls[0][0])  # never the whole list up front
         self.assertTrue(any("Trying again, attempt 2 of 3" in e["text"] for e in server.LOG))
 
     def test_a_stuck_transfer_is_ended(self):
@@ -240,30 +242,39 @@ class ScheduledTest(unittest.TestCase):
 
 
 class FullSyncProgressTest(unittest.TestCase):
-    def test_scanning_then_comparing_moves_the_bar(self):
+    def test_progress_while_rsync_lists_the_folder_bit_by_bit(self):
         jobs = server.Jobs()
         jobs.info = {"folder": "Photos", "state": "running", "kind": "full", "phase": ""}
         jobs.progress = server.new_progress()
         before = list(server.LOG)
-        jobs._on_progress("building file list ... ")
-        for n in range(0, 1000, 100):
-            jobs._on_progress(f" {n} files...")
+        jobs._on_progress("sending incremental file list")
         info = jobs.snapshot()  # always the latest count, also when rsync then goes quiet
-        self.assertEqual((info["phase"], info["scanned"], info["percent"], info["quiet"]), ("Scanning", 900, 0, 0))
-        jobs._on_progress("400 files to consider")
+        self.assertEqual((info["phase"], info["percent"], info["quiet"]), ("Starting", None, 0))
         for i in range(100):
             jobs._on_progress(f"@lsw@ .f          1 0 d/f{i}")
         jobs._on_progress("@lsw@ *deleting   0 0 old")
-        jobs._on_progress("     1,000,000  10%   40.00MB/s    0:00:01 (xfr#1, to-chk=10/400)")
+        jobs._on_progress("     1,000,000  10%   40.00MB/s    0:00:01 (xfr#1, ir-chk=10/300)")
         info = jobs.snapshot()
-        self.assertEqual((info["phase"], info["items"], info["checked"], info["percent"]),
-                         ("Comparing and sending", 400, 100, 25))
+        # The list is still growing: no total yet, so no percent either
+        self.assertEqual((info["phase"], info["items"], info["items_note"], info["checked"], info["percent"]),
+                         ("Comparing and sending", 300, "so far", 100, None))
         self.assertEqual((info["bytes"], info["speed"]), (1_000_000, "40.00MB/s"))
-        jobs._on_progress("   300,000,000  60%   40.00MB/s    0:00:01 (xfr#2, to-chk=9/400)")
-        self.assertEqual(jobs.snapshot()["percent"], 60)  # bytes sent can be ahead of items compared
+        jobs._on_progress("     2,000,000  12%   40.00MB/s    0:00:01 (xfr#2, to-chk=9/400)")
+        info = jobs.snapshot()
+        self.assertEqual((info["items"], info["items_note"], info["percent"]), (400, "", 25))
         self.assertEqual(list(server.LOG), before)  # none of this goes to the log
         jobs.progress = {}
         self.assertEqual(jobs.snapshot()["phase"], "")  # after rsync, the job's own phase shows again
+
+    def test_the_last_count_gives_an_estimate(self):
+        jobs = server.Jobs()
+        jobs.info = {"folder": "Photos", "state": "running", "kind": "full", "phase": ""}
+        jobs.progress = server.new_progress(expected=1000)
+        for i in range(250):
+            jobs._on_progress(f"@lsw@ .f          1 0 d/f{i}")
+        jobs._on_progress("     1,000  0%   40.00MB/s    0:00:01 (xfr#1, ir-chk=10/300)")
+        info = jobs.snapshot()
+        self.assertEqual((info["items"], info["items_note"], info["percent"]), (1000, "about", 25))
 
     def test_what_rsync_waits_for(self):
         self.assertEqual(server.waiting_on("do_select"), "the backup server")
@@ -275,12 +286,18 @@ class FullSyncProgressTest(unittest.TestCase):
 
     def test_what_the_backup_waits_for(self):
         describe = server.describe_backup
-        found = [{"wchan": "do_select", "file": ""},
-                 {"wchan": "balance_dirty_pages", "file": "/backup/Mika/School/.raspios.img.Xy12"}]
+        waiting = [["S", "do_select"]] * 10
+        writing = [["D", "folio_wait_bit_common"]] * 7 + [["R", "0"]] * 3
+        found = [{"cpu": 2, "waits": waiting, "file": ""},
+                 {"cpu": 30, "waits": writing, "file": "/backup/Mika/School/.raspios.img.Xy12"}]
         self.assertEqual(describe(found, "/backup"),
                          "On the backup server, rsync waits for its disk (Mika/School/.raspios.img.Xy12).")
-        self.assertIn("connection between them is stuck", describe([{"wchan": "do_select", "file": ""}] * 2, "/backup"))
-        self.assertIn("busy", describe([{"wchan": "0", "file": ""}], "/backup"))
+        self.assertIn("connection between them is stuck",
+                      describe([{"cpu": 0, "waits": waiting, "file": ""}] * 2, "/backup"))
+        busy = describe([{"cpu": 98, "waits": [["R", "0"]] * 10, "file": ""}, {"cpu": 1, "waits": waiting, "file": ""}],
+                        "/backup")
+        self.assertIn("uses 98% of one CPU core", busy)
+        self.assertIn("only use one core", busy)
         self.assertEqual(describe([], "/backup"), "No rsync is running on the backup server.")
 
     def test_backup_probe_finds_rsync(self):
